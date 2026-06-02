@@ -83,6 +83,10 @@ dependencies:
     version: 696e0efa7273b002f0ed59286fe5eb07f3a81566
     git: https://github.com/luar123/snapclient.git
     path: components/dsp_processor
+  dsp_processor_settings:
+    version: 696e0efa7273b002f0ed59286fe5eb07f3a81566
+    git: https://github.com/luar123/snapclient.git
+    path: components/dsp_processor_settings
   flac:
     version: 696e0efa7273b002f0ed59286fe5eb07f3a81566
     git: https://github.com/luar123/snapclient.git

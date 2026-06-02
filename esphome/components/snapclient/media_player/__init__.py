@@ -11,8 +11,19 @@ from esphome.components.i2s_audio import (
     register_i2s_audio_component,
 )
 import esphome.config_validation as cv
-from esphome.const import CONF_AUDIO_DAC, CONF_NAME, CONF_PORT, CONF_TYPE
-from esphome.core import CORE
+from esphome.const import (
+    CONF_AUDIO_DAC,
+    CONF_DISABLED_BY_DEFAULT,
+    CONF_ENTITY_CATEGORY,
+    CONF_NAME,
+    CONF_PORT,
+    CONF_TYPE,
+    ENTITY_CATEGORY_DIAGNOSTIC,
+)
+from esphome.core import CORE, ID
+from esphome.core.entity_helpers import setup_entity
+
+from .. import snapclient_ns
 
 CODEOWNERS = ["@luar123"]
 
@@ -22,13 +33,21 @@ AUTO_LOAD = ["mdns", "socket"]
 CONF_HOSTNAME = "hostname"
 CONF_MUTE_PIN = "mute_pin"
 CONF_CONTROL_PORT = "control_port"
+CONF_VOLUME_CURVE_DB_RANGE = "volume_curve_db_range"
 
 SNAPCLIENT_GIT_VERSION = "c4e9b8da5ecdab6c90ab0baf310ce067a6cff3f0"
 SNAPCLIENT_GIT_REPO = "https://github.com/W-Floyd/snapclient.git"
+SNAPCLIENT_PATH = "/Users/william/Documents/Personal/git/snapclient"
 
-snapclient_ns = cg.esphome_ns.namespace("snapclient")
 SnapClientComponent = snapclient_ns.class_(
     "SnapClientComponent", cg.Component, media_player.MediaPlayer, I2SAudioOut
+)
+
+# Number component for volume curve dB range
+VolumeCurveDbRange = snapclient_ns.class_(
+    "VolumeCurveDbRange",
+    cg.Component,
+    cg.EntityBase,
 )
 
 
@@ -60,6 +79,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_I2S_DOUT_PIN): pins.internal_gpio_output_pin_number,
             cv.Optional(CONF_MUTE_PIN): pins.gpio_output_pin_schema,
             cv.Optional(CONF_AUDIO_DAC): cv.use_id(audio_dac.AudioDac),
+            cv.Optional(CONF_VOLUME_CURVE_DB_RANGE, default=60): cv.int_range(
+                min=0, max=90
+            ),
         }
     )
     .extend(cv.COMPONENT_SCHEMA),
@@ -71,6 +93,7 @@ async def to_code(config):
     add_idf_component(name="espressif/esp-dsp", ref=">1.5.0")
     for component in [
         "dsp_processor",
+         "dsp_processor_settings",
         "flac",
         "libbuffer",
         "libmedian",
@@ -81,9 +104,11 @@ async def to_code(config):
     ]:
         add_idf_component(
             name=component,
-            ref=SNAPCLIENT_GIT_VERSION,
-            repo=SNAPCLIENT_GIT_REPO,
-            path=f"components/{component}",
+            # ref=SNAPCLIENT_GIT_VERSION,
+            # repo=SNAPCLIENT_GIT_REPO,
+            # repo=SNAPCLIENT_PATH,
+            # path=f"components/{component}",
+            path=SNAPCLIENT_PATH + f"/components/{component}",
         )
     if CONF_AUDIO_DAC not in config:
         add_idf_sdkconfig_option("CONFIG_USE_DSP_PROCESSOR", True)
@@ -95,8 +120,14 @@ async def to_code(config):
     if not use_mdns:
         add_idf_sdkconfig_option("CONFIG_SNAPSERVER_HOST", str(config[CONF_HOSTNAME]))
     add_idf_sdkconfig_option("CONFIG_SNAPSERVER_PORT", int(config[CONF_PORT]))
-    add_idf_sdkconfig_option("CONFIG_SNAPSERVER_CONTROL_PORT", int(config[CONF_CONTROL_PORT]))
+    add_idf_sdkconfig_option(
+        "CONFIG_SNAPSERVER_CONTROL_PORT", int(config[CONF_CONTROL_PORT])
+    )
     add_idf_sdkconfig_option("CONFIG_SNAPSERVER_USE_MDNS", use_mdns)
+    add_idf_sdkconfig_option(
+        "CONFIG_SNAPCLIENT_VOLUME_CURVE_DB_RANGE",
+        config[CONF_VOLUME_CURVE_DB_RANGE],
+    )
     add_idf_sdkconfig_option("CONFIG_SNAPCLIENT_NAME", config[CONF_NAME])
     add_idf_sdkconfig_option("CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES", 2)
     ethernet = CORE.config.get("ethernet")
@@ -121,3 +152,25 @@ async def to_code(config):
     if audio_dac_config := config.get(CONF_AUDIO_DAC):
         aud_dac = await cg.get_variable(audio_dac_config)
         cg.add(var.set_audio_dac(aud_dac))
+
+    # Register the volume curve NumberEntity - disabled by default
+    vol_curve_id = ID("volume_curve_db_range", type=VolumeCurveDbRange)
+    vol_curve_var = cg.new_Pvariable(vol_curve_id)
+    vol_curve_config = {
+        CONF_NAME: "Volume Curve dB Range",
+        CONF_DISABLED_BY_DEFAULT: True,
+        CONF_ENTITY_CATEGORY: ENTITY_CATEGORY_DIAGNOSTIC,
+    }
+    await setup_entity(vol_curve_var, vol_curve_config, "number")
+    cg.add(vol_curve_var.traits.set_min_value(0))
+    cg.add(vol_curve_var.traits.set_max_value(90))
+    cg.add(vol_curve_var.traits.set_step(1))
+    cg.add(
+        cg.RawStatement(
+            "id(volume_curve_db_range).traits.set_mode(esphome::number::NUMBER_MODE_SLIDER);"
+        )
+    )
+    cg.add(cg.App.register_number(vol_curve_var))
+
+    # Set initial value from config
+    cg.add(vol_curve_var.publish_state(config[CONF_VOLUME_CURVE_DB_RANGE]))

@@ -12,6 +12,8 @@
 #include "esphome/components/i2s_audio/i2s_audio.h"
 #include "esphome/core/gpio.h"
 #include "player.h"
+#include "dsp_processor.h"
+#include "esphome/components/number/number.h"
 
 #ifdef USE_AUDIO_DAC
 #include "esphome/components/audio_dac/audio_dac.h"
@@ -90,7 +92,16 @@ class SnapClientComponent : public i2s_audio::I2SAudioOut, public media_player::
 #endif
 };
 
-}  // namespace esphome::snapclient
+class VolumeCurveDbRange : public number::Number {
+ public:
+  void control(float value) override {
+    ESP_LOGD("snapclient.number", "Volume curve dB range set to %.0f", value);
+    dsp_processor_set_volume_curve_db_range(value);
+    this->publish_state(value);
+   }
+};
+
+}   // namespace esphome::snapclient
 
 #endif
 #endif
