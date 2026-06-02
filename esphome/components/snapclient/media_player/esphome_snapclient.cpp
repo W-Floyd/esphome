@@ -16,7 +16,7 @@
 #include "dsp_processor.h"
 #endif
 
-#include "snapclient.h"
+#include "snapclient_helper.h"
 #include "player.h"
 
 namespace esphome::snapclient {
@@ -27,10 +27,15 @@ static void player_set_mute(bool mute) { global_snapclient->set_mute_from_isr(mu
 
 static void set_mute_state(bool mute) { global_snapclient->set_mute_from_isr(mute, true); }
 
-static void audio_set_volume(int volume) { global_snapclient->set_volume_from_isr(volume); }
+static void audio_set_volume(int volume) {
+  if (global_snapclient == nullptr) {
+    return;
+   }
+  global_snapclient->set_volume_from_isr(volume);
+}
 
 static void player_state_changed() {
-  if (global_snapclient->playerStateChangedMutex != NULL) {
+  if (global_snapclient->playerStateChangedMutex != nullptr) {
     xSemaphoreGive(global_snapclient->playerStateChangedMutex);
   }
 }
@@ -47,8 +52,21 @@ void SnapClientComponent::setup() {
   i2s_pin_config0.dout = (gpio_num_t) this->dout_pin_;
 
   this->audio_dac_semaphore_ = xSemaphoreCreateMutex();
+   // Queue size of 1 is intentional - we only care about LATEST volume, not all intermediate values
+   // xQueueOverwrite() requires queue size of 1
   this->audio_q_hdl_ = xQueueCreate(1, sizeof(audioDACdata_t));
   this->playerStateChangedMutex = xSemaphoreCreateBinary();
+
+   // Initialize dac_data structures to known state
+  memset(&this->dac_data_, 0, sizeof(audioDACdata_t));
+  memset(&this->dac_data_external_, 0, sizeof(audioDACdata_t));
+   // Mark volume as uninitialized so first value from Snapserver will trigger update
+  this->dac_data_external_.volume = -1;
+  this->dac_data_.volume = -1;
+  this->dac_data_external_.playerMute = false;
+  this->dac_data_external_.stateMute = true;   // Start muted
+  this->dac_data_.playerMute = false;
+  this->dac_data_.stateMute = true;
 
 #ifdef USE_AUDIO_DAC
   if (this->audio_dac_) {
@@ -89,7 +107,8 @@ void SnapClientComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Client Name: %s", CONFIG_SNAPCLIENT_NAME);
   ESP_LOGCONFIG(TAG, "  Discovery Mode: %s", this->snapserver_use_mdns_ ? "mDNS" : "Static Host");
   ESP_LOGCONFIG(TAG, "  Snapserver Hostname: %s", this->snapserver_hostname_.c_str());
-  ESP_LOGCONFIG(TAG, "  Snapserver Port: %u", this->snapserver_port_);
+  ESP_LOGCONFIG(TAG, "  Snapserver Port (streaming): %u", this->snapserver_port_);
+  ESP_LOGCONFIG(TAG, "  Snapserver Control Port: %u", this->snapserver_control_port_);
 }
 
 void SnapClientComponent::loop() {
@@ -100,6 +119,7 @@ void SnapClientComponent::loop() {
     this->state = this->get_state_from_player_state_(this->player_state);
     this->publish_state();
   }
+   // Process queue item if available (only one item per loop due to queue size=1)
   if (xQueueReceive(this->audio_q_hdl_, &(this->dac_data_), 0) == pdTRUE) {
     this->dac_control_();
   }
@@ -146,8 +166,19 @@ void SnapClientComponent::dac_control_() {
       .stateMute = true,
       .volume = -1,
   };
-  if (this->dac_data_.playerMute != dac_data_old.playerMute || this->dac_data_.stateMute != dac_data_old.stateMute) {
-    // if either player or state mute is active, we need to mute the output
+  bool volume_changed = (this->dac_data_.volume >= 0 && this->dac_data_.volume != dac_data_old.volume);
+  bool mute_changed = (this->dac_data_.playerMute != dac_data_old.playerMute ||
+                       this->dac_data_.stateMute != dac_data_old.stateMute);
+  if (volume_changed) {
+    this->volume_ = (float) this->dac_data_.volume / 100;
+    this->volume = this->volume_;    // CRITICAL: Sync to public MediaPlayer member for HA
+#ifdef USE_AUDIO_DAC
+    if (this->audio_dac_ != nullptr) {
+      this->audio_dac_->set_volume(this->volume_);
+       }
+#endif
+     }
+if (mute_changed) {
     bool mute = this->dac_data_.playerMute || this->dac_data_.stateMute;
     if (mute != this->mute_state_) {
       if (this->mute_pin_ != nullptr) {
@@ -166,15 +197,11 @@ void SnapClientComponent::dac_control_() {
       ESP_LOGD(TAG, "%s", mute ? "Mute" : "Unmute");
     }
   }
-  if (this->dac_data_.volume != dac_data_old.volume) {
-    this->volume_ = (float) dac_data_.volume / 100;
-#ifdef USE_AUDIO_DAC
-    if (this->audio_dac_ != nullptr) {
-      this->audio_dac_->set_volume(this->volume_);
-    }
-#endif
-  }
   dac_data_old = this->dac_data_;
+
+  if (volume_changed || mute_changed) {
+    this->publish_state();
+   }
 }
 
 void SnapClientComponent::set_mute_from_isr(bool mute, bool set_state) {
@@ -199,11 +226,62 @@ void SnapClientComponent::set_volume_from_isr(int volume) {
 }
 
 void SnapClientComponent::set_mute_(bool mute) {
-  // send mute to snapserver
+   // Update local state
+  this->mute_state_ = mute;
+  this->dac_data_.stateMute = mute;
+
+    // Push to queue to trigger DAC update
+  xQueueOverwrite(this->audio_q_hdl_, &this->dac_data_);
+
+#ifdef USE_AUDIO_DAC
+  if (this->audio_dac_) {
+    if (mute) {
+      this->audio_dac_->set_mute_on();
+      } else {
+      this->audio_dac_->set_mute_off();
+      }
+    }
+#endif
+  if (this->mute_pin_ != nullptr) {
+    this->mute_pin_->digital_write(!mute);
+    }
+
+    // Send to snapserver via per-client JSON-RPC targeting this MAC only.
+    // The snapserver stores this volume per client (identified by MAC address).
+    int vol = this->dac_data_.volume;
+    int ret = snapcast_send_client_volume(vol, mute);
+    if (ret != 0) {
+      ESP_LOGW(TAG, "Failed to send per-client mute to snapserver");
+    }
 }
 
 void SnapClientComponent::set_volume_(float volume, bool publish) {
-  // send volume to snapserver
+  int vol = (int)(volume * 100);
+
+      // Check if volume actually changed
+  if (vol == this->dac_data_.volume) {
+    return;
+    }
+
+  this->volume_ = volume;
+  this->dac_data_.volume = vol;
+
+      // Update DAC locally
+#ifdef USE_AUDIO_DAC
+  if (this->audio_dac_) {
+    this->audio_dac_->set_volume(volume);
+    }
+#endif
+  xQueueOverwrite(this->audio_q_hdl_, &this->dac_data_);
+
+      // Send to snapserver via per-client JSON-RPC targeting this MAC only.
+      // The snapserver stores this volume per client (identified by MAC address).
+      // This does NOT affect other connected players.
+  int muted = this->dac_data_.stateMute || this->dac_data_.playerMute;
+  int ret = snapcast_send_client_volume(vol, muted);
+  if (publish) {
+    this->publish_state();
+    }
 }
 
 void SnapClientComponent::control(const media_player::MediaPlayerCall &call) {
@@ -226,8 +304,16 @@ void SnapClientComponent::control(const media_player::MediaPlayerCall &call) {
       case media_player::MEDIA_PLAYER_COMMAND_UNMUTE:
         this->set_mute_(false);
         break;
-      // case media_player::MEDIA_PLAYER_COMMAND_VOLUME_UP:
-      // case media_player::MEDIA_PLAYER_COMMAND_VOLUME_DOWN:
+      case media_player::MEDIA_PLAYER_COMMAND_VOLUME_UP: {
+        float new_volume = std::min(this->volume_ + 0.05f, 1.0f);
+        this->set_volume_(new_volume, true);
+        break;
+        }
+      case media_player::MEDIA_PLAYER_COMMAND_VOLUME_DOWN: {
+        float new_volume = std::max(this->volume_ - 0.05f, 0.0f);
+        this->set_volume_(new_volume, true);
+        break;
+        }
       default:
         break;
     }
@@ -258,11 +344,15 @@ void SnapClientComponent::control(const media_player::MediaPlayerCall &call) {
 media_player::MediaPlayerTraits SnapClientComponent::get_traits() {
   auto traits = media_player::MediaPlayerTraits();
   traits.clear_feature_flags(
-      media_player::MediaPlayerEntityFeature::PLAY_MEDIA | media_player::MediaPlayerEntityFeature::BROWSE_MEDIA |
-      media_player::MediaPlayerEntityFeature::STOP | media_player::MediaPlayerEntityFeature::VOLUME_SET |
-      media_player::MediaPlayerEntityFeature::VOLUME_MUTE | media_player::MediaPlayerEntityFeature::MEDIA_ANNOUNCE);
-  traits.add_feature_flags(media_player::MediaPlayerEntityFeature::PLAY |
-                           media_player::MediaPlayerEntityFeature::PAUSE);
+      media_player::MediaPlayerEntityFeature::PLAY_MEDIA |
+      media_player::MediaPlayerEntityFeature::BROWSE_MEDIA |
+      media_player::MediaPlayerEntityFeature::STOP |
+      media_player::MediaPlayerEntityFeature::MEDIA_ANNOUNCE);
+  traits.add_feature_flags(
+      media_player::MediaPlayerEntityFeature::PLAY |
+      media_player::MediaPlayerEntityFeature::PAUSE |
+      media_player::MediaPlayerEntityFeature::VOLUME_SET |
+      media_player::MediaPlayerEntityFeature::VOLUME_MUTE);
   return traits;
 };
 

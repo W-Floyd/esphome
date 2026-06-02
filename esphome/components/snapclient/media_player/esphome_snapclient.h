@@ -37,6 +37,7 @@ class SnapClientComponent : public i2s_audio::I2SAudioOut, public media_player::
   void set_dout_pin(uint8_t pin) { this->dout_pin_ = pin; }
   void set_snapserver_hostname(const std::string &hostname) { this->snapserver_hostname_ = hostname; }
   void set_snapserver_port(uint16_t port) { this->snapserver_port_ = port; }
+  void set_snapserver_control_port(uint16_t port) { this->snapserver_control_port_ = port; }
   void set_snapserver_use_mdns(bool use_mdns) { this->snapserver_use_mdns_ = use_mdns; }
 #ifdef USE_AUDIO_DAC
   void set_audio_dac(audio_dac::AudioDac *audio_dac) { this->audio_dac_ = audio_dac; }
@@ -77,6 +78,7 @@ class SnapClientComponent : public i2s_audio::I2SAudioOut, public media_player::
   uint8_t dout_pin_;
   std::string snapserver_hostname_{};
   uint16_t snapserver_port_{1704};
+  uint16_t snapserver_control_port_{1705};
   bool snapserver_use_mdns_{true};
   bool network_initialized_{false};
   audioDACdata_t dac_data_;

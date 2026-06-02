@@ -21,9 +21,10 @@ AUTO_LOAD = ["mdns", "socket"]
 
 CONF_HOSTNAME = "hostname"
 CONF_MUTE_PIN = "mute_pin"
+CONF_CONTROL_PORT = "control_port"
 
-SNAPCLIENT_GIT_VERSION = "1dfe76aa3b057f60985ebec5a867b073924eeef1"
-SNAPCLIENT_GIT_REPO = "https://github.com/luar123/snapclient.git"
+SNAPCLIENT_GIT_VERSION = "c4e9b8da5ecdab6c90ab0baf310ce067a6cff3f0"
+SNAPCLIENT_GIT_REPO = "https://github.com/W-Floyd/snapclient.git"
 
 snapclient_ns = cg.esphome_ns.namespace("snapclient")
 SnapClientComponent = snapclient_ns.class_(
@@ -55,6 +56,7 @@ CONFIG_SCHEMA = cv.All(
             # Empty hostname means "discover via mDNS".
             cv.Optional(CONF_HOSTNAME): cv.domain,
             cv.Optional(CONF_PORT, default=1704): cv.port,
+            cv.Optional(CONF_CONTROL_PORT, default=1705): cv.port,
             cv.Required(CONF_I2S_DOUT_PIN): pins.internal_gpio_output_pin_number,
             cv.Optional(CONF_MUTE_PIN): pins.gpio_output_pin_schema,
             cv.Optional(CONF_AUDIO_DAC): cv.use_id(audio_dac.AudioDac),
@@ -93,6 +95,7 @@ async def to_code(config):
     if not use_mdns:
         add_idf_sdkconfig_option("CONFIG_SNAPSERVER_HOST", str(config[CONF_HOSTNAME]))
     add_idf_sdkconfig_option("CONFIG_SNAPSERVER_PORT", int(config[CONF_PORT]))
+    add_idf_sdkconfig_option("CONFIG_SNAPSERVER_CONTROL_PORT", int(config[CONF_CONTROL_PORT]))
     add_idf_sdkconfig_option("CONFIG_SNAPSERVER_USE_MDNS", use_mdns)
     add_idf_sdkconfig_option("CONFIG_SNAPCLIENT_NAME", config[CONF_NAME])
     add_idf_sdkconfig_option("CONFIG_FREERTOS_TASK_NOTIFICATION_ARRAY_ENTRIES", 2)
@@ -110,6 +113,7 @@ async def to_code(config):
     cg.add(var.set_dout_pin(config[CONF_I2S_DOUT_PIN]))
     cg.add(var.set_snapserver_hostname(config.get(CONF_HOSTNAME, "")))
     cg.add(var.set_snapserver_port(config[CONF_PORT]))
+    cg.add(var.set_snapserver_control_port(config[CONF_CONTROL_PORT]))
     cg.add(var.set_snapserver_use_mdns(use_mdns))
     if CONF_MUTE_PIN in config:
         pin = await cg.gpio_pin_expression(config[CONF_MUTE_PIN])
