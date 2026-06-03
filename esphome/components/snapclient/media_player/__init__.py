@@ -28,7 +28,7 @@ from .. import snapclient_ns
 CODEOWNERS = ["@luar123"]
 
 DEPENDENCIES = ["esp32", "i2s_audio"]
-AUTO_LOAD = ["mdns", "socket"]
+AUTO_LOAD = ["mdns", "number", "socket"]
 
 CONF_HOSTNAME = "hostname"
 CONF_MUTE_PIN = "mute_pin"
@@ -105,6 +105,7 @@ async def to_code(config):
             name=component,
             ref=SNAPCLIENT_GIT_VERSION,
             repo=SNAPCLIENT_GIT_REPO,
+            path=f"components/{component}",
         )
     if CONF_AUDIO_DAC not in config:
         add_idf_sdkconfig_option("CONFIG_USE_DSP_PROCESSOR", True)
@@ -167,6 +168,7 @@ async def to_code(config):
         )
     )
     cg.add(cg.App.register_number(vol_curve_var))
+    CORE.register_platform_component("number", vol_curve_var)
 
     # Set initial value from config
     cg.add(vol_curve_var.publish_state(config[CONF_VOLUME_CURVE_DB_RANGE]))
