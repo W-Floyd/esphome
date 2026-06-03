@@ -35,9 +35,8 @@ CONF_MUTE_PIN = "mute_pin"
 CONF_CONTROL_PORT = "control_port"
 CONF_VOLUME_CURVE_DB_RANGE = "volume_curve_db_range"
 
-SNAPCLIENT_GIT_VERSION = "c4e9b8da5ecdab6c90ab0baf310ce067a6cff3f0"
+SNAPCLIENT_GIT_VERSION = "5a1128290d61615c49dcb8d9b6202c8a2dcd09c6"
 SNAPCLIENT_GIT_REPO = "https://github.com/W-Floyd/snapclient.git"
-SNAPCLIENT_PATH = "/Users/william/Documents/Personal/git/snapclient"
 
 SnapClientComponent = snapclient_ns.class_(
     "SnapClientComponent", cg.Component, media_player.MediaPlayer, I2SAudioOut
@@ -93,7 +92,7 @@ async def to_code(config):
     add_idf_component(name="espressif/esp-dsp", ref=">1.5.0")
     for component in [
         "dsp_processor",
-         "dsp_processor_settings",
+        "dsp_processor_settings",
         "flac",
         "libbuffer",
         "libmedian",
@@ -104,11 +103,8 @@ async def to_code(config):
     ]:
         add_idf_component(
             name=component,
-            # ref=SNAPCLIENT_GIT_VERSION,
-            # repo=SNAPCLIENT_GIT_REPO,
-            # repo=SNAPCLIENT_PATH,
-            # path=f"components/{component}",
-            path=SNAPCLIENT_PATH + f"/components/{component}",
+            ref=SNAPCLIENT_GIT_VERSION,
+            repo=SNAPCLIENT_GIT_REPO,
         )
     if CONF_AUDIO_DAC not in config:
         add_idf_sdkconfig_option("CONFIG_USE_DSP_PROCESSOR", True)
