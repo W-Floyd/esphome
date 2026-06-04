@@ -35,7 +35,7 @@ CONF_MUTE_PIN = "mute_pin"
 CONF_CONTROL_PORT = "control_port"
 CONF_VOLUME_CURVE_DB_RANGE = "volume_curve_db_range"
 
-SNAPCLIENT_GIT_VERSION = "5a1128290d61615c49dcb8d9b6202c8a2dcd09c6"
+SNAPCLIENT_GIT_VERSION = "98df2b2b8e02fe6b9c62b755656ca38384986706"
 SNAPCLIENT_GIT_REPO = "https://github.com/W-Floyd/snapclient.git"
 
 SnapClientComponent = snapclient_ns.class_(
