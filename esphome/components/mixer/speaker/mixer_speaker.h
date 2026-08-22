@@ -58,6 +58,7 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
   void finish() override;
 
   bool has_buffered_data() const override;
+  bool buffered_bytes(size_t &bytes) const override;
 
   /// @brief Mute state changes are passed to the parent's output speaker
   void set_mute_state(bool mute_state) override;

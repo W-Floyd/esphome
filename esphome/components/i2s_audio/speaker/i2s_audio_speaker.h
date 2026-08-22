@@ -76,6 +76,7 @@ class I2SAudioSpeakerBase : public I2SAudioOut, public speaker::Speaker, public 
   size_t play(const uint8_t *data, size_t length) override { return play(data, length, 0); }
 
   bool has_buffered_data() const override;
+  bool buffered_bytes(size_t &bytes) const override;
 
   /// @brief Sets the volume of the speaker. Uses the speaker's configured audio dac component. If unavailble, it is
   /// implemented as a software volume control. Overrides the default setter to convert the floating point volume to a

@@ -218,6 +218,20 @@ bool I2SAudioSpeakerBase::has_buffered_data() const {
   return false;
 }
 
+bool I2SAudioSpeakerBase::buffered_bytes(size_t &bytes) const {
+  // NOTE: this covers the ring buffer only. Audio already handed to the I2S DMA descriptors is
+  // downstream of it and not included, so the true latency to the pin is this plus up to
+  // buffer_duration. Bounded and known, unlike an unreported fill.
+  if (this->audio_ring_buffer_.use_count() > 0) {
+    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->audio_ring_buffer_.lock();
+    if (temp_ring_buffer != nullptr) {
+      bytes = temp_ring_buffer->available();
+      return true;
+    }
+  }
+  return false;
+}
+
 void I2SAudioSpeakerBase::speaker_task(void *params) {
   I2SAudioSpeakerBase *this_speaker = (I2SAudioSpeakerBase *) params;
   this_speaker->run_speaker_task();

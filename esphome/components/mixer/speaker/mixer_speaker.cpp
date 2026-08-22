@@ -281,6 +281,16 @@ bool SourceSpeaker::has_buffered_data() const {
   return ((this->audio_source_.use_count() > 0) && this->audio_source_->has_buffered_data());
 }
 
+bool SourceSpeaker::buffered_bytes(size_t &bytes) const {
+  // This source's own queue only. What the mixer has already combined and passed to the output
+  // speaker is that speaker's to report, so a caller wanting total latency sums the two.
+  if (this->audio_source_.use_count() == 0) {
+    return false;
+  }
+  bytes = this->audio_source_->buffered_bytes();
+  return true;
+}
+
 void SourceSpeaker::set_mute_state(bool mute_state) {
   this->mute_state_ = mute_state;
   this->parent_->get_output_speaker()->set_mute_state(mute_state);
