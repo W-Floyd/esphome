@@ -282,27 +282,54 @@ bool SourceSpeaker::has_buffered_data() const {
 }
 
 bool SourceSpeaker::buffered_bytes(size_t &bytes) const {
-  // This source's own queue only. What the mixer has already combined and passed to the output
-  // speaker is that speaker's to report, so a caller wanting total latency sums the two.
+  // TOTAL latency from this source's input to the output speaker's input: this source's own queue
+  // PLUS whatever the mixer has already combined and handed downstream.
+  //
+  // Reporting only the source queue was wrong precisely when the value matters. After a starvation
+  // the source ring is genuinely empty while the output speaker still holds a few hundred ms, so a
+  // caller anchoring its accounting to "0" believes the pipeline is empty when it is not, predicts
+  // playout that much too early, and delays real audio to compensate. Measured: a device logging
+  // "measured fill: 0 frames" settled with 69 ms accounted against a ~269 ms true fill and played
+  // ~200 ms behind its peers.
+  //
+  // The two queues are in series and hold different audio (pre- and post-mix), so summing them is
+  // correct and does not double count.
   //
   // Gate on the RING BUFFER, not on audio_source_. play() writes into ring_buffer_, while
   // audio_source_ is the consumer-side wrapper the mixer task constructs in start_() -- so a
   // writer can legitimately have queued audio before audio_source_ exists. Gating on the latter
   // reported "cannot tell" while the ring held data, which reads identically to an empty pipeline
   // at the call site.
+  size_t own = 0;
+  bool have_own = false;
   if (this->audio_source_.use_count() > 0) {
-    // Complete: RingBufferAudioSource::buffered_bytes() already includes ring_buffer_->available()
-    // alongside its own in-flight exposure and queued item, so this must not be added to it.
-    bytes = this->audio_source_->buffered_bytes();
-    return true;
+    // RingBufferAudioSource::buffered_bytes() already includes ring_buffer_->available() alongside
+    // its own in-flight exposure and queued item, so that must not be added to it.
+    own = this->audio_source_->buffered_bytes();
+    have_own = true;
+  } else {
+    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
+    if (temp_ring_buffer != nullptr) {
+      // No consumer wrapper yet, so nothing can be in flight beyond the ring itself
+      own = temp_ring_buffer->available();
+      have_own = true;
+    }
   }
-  std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
-  if (temp_ring_buffer != nullptr) {
-    // No consumer wrapper yet, so nothing can be in flight beyond the ring itself
-    bytes = temp_ring_buffer->available();
-    return true;
+  if (!have_own) {
+    return false;
   }
-  return false;
+
+  // Downstream is optional: a platform that cannot report it leaves the caller with the source
+  // queue alone, which is strictly better than nothing and no worse than the previous behaviour.
+  size_t downstream = 0;
+  if (this->parent_ != nullptr) {
+    speaker::Speaker *out = this->parent_->get_output_speaker();
+    if (out != nullptr) {
+      out->buffered_bytes(downstream);
+    }
+  }
+  bytes = own + downstream;
+  return true;
 }
 
 void SourceSpeaker::set_mute_state(bool mute_state) {
