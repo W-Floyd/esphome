@@ -323,9 +323,17 @@ bool SourceSpeaker::buffered_bytes(size_t &bytes) const {
   // queue alone, which is strictly better than nothing and no worse than the previous behaviour.
   size_t downstream = 0;
   if (this->parent_ != nullptr) {
+    // The mixer task's own output transfer buffer sits between the source rings and the output
+    // speaker, and holds up to TRANSFER_BUFFER_DURATION_MS. It is task-local, so it was the last
+    // unreachable stage of the chain: a caller summing only the layers it could see under-reported
+    // its latency by ~50 ms, which is exactly the residual that remained after the DMA was counted.
+    downstream += this->parent_->output_transfer_bytes();
     speaker::Speaker *out = this->parent_->get_output_speaker();
     if (out != nullptr) {
-      out->buffered_bytes(downstream);
+      size_t out_bytes = 0;
+      if (out->buffered_bytes(out_bytes)) {
+        downstream += out_bytes;
+      }
     }
   }
   bytes = own + downstream;
@@ -536,6 +544,7 @@ void MixerSpeaker::audio_mixer_task(void *params) {
 
       // Never shift the data in the output transfer buffer to avoid unnecessary, slow data moves
       output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false);
+      this_mixer->output_transfer_bytes_.store(output_transfer_buffer->available(), std::memory_order_relaxed);
 
       const uint32_t output_frames_free =
           this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->free());
@@ -603,6 +612,7 @@ void MixerSpeaker::audio_mixer_task(void *params) {
 
           // Update output transfer buffer length and pipeline frame count
           output_transfer_buffer->increase_buffer_length(output_info.frames_to_bytes(frames_to_mix));
+          this_mixer->output_transfer_bytes_.store(output_transfer_buffer->available(), std::memory_order_relaxed);
           this_mixer->frames_in_pipeline_.fetch_add(frames_to_mix, std::memory_order_release);
         } else {
           // Speaker's stream info doesn't match the output speaker's, so it's a new source speaker
@@ -667,6 +677,7 @@ void MixerSpeaker::audio_mixer_task(void *params) {
 
         // Update output transfer buffer length and pipeline frame count (once, not per source)
         output_transfer_buffer->increase_buffer_length(output_info.frames_to_bytes(frames_to_mix));
+        this_mixer->output_transfer_bytes_.store(output_transfer_buffer->available(), std::memory_order_relaxed);
         this_mixer->frames_in_pipeline_.fetch_add(frames_to_mix, std::memory_order_release);
       }
     }
@@ -677,6 +688,7 @@ void MixerSpeaker::audio_mixer_task(void *params) {
   // Reset pipeline frame count since the task is stopping
   this_mixer->frames_in_pipeline_.store(0, std::memory_order_release);
 
+  this_mixer->output_transfer_bytes_.store(0, std::memory_order_relaxed);
   xEventGroupSetBits(this_mixer->event_group_, MIXER_TASK_STATE_STOPPED);
 
   vTaskSuspend(nullptr);  // Suspend this task indefinitely until the loop method deletes it
