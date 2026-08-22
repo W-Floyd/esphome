@@ -219,15 +219,28 @@ bool I2SAudioSpeakerBase::has_buffered_data() const {
 }
 
 bool I2SAudioSpeakerBase::buffered_bytes(size_t &bytes) const {
-  // NOTE: this covers the ring buffer only. Audio already handed to the I2S DMA descriptors is
-  // downstream of it and not included, so the true latency to the pin is this plus up to
-  // buffer_duration. Bounded and known, unlike an unreported fill.
+  // Ring buffer PLUS the DMA descriptors' full occupancy, so this answers "how long until audio
+  // handed over now reaches the pin".
+  //
+  // The DMA term must include silence padding, and that is the whole point. Lockstep write records
+  // count only REAL frames per descriptor, so the played-frames callback never reports padding --
+  // yet padding still takes time to clock out. A consumer that schedules playback from the callback
+  // therefore underestimates its own latency by exactly the padding, and renders that much late.
+  // Measured across four synchronised clients: devices whose DMA had refilled with padding after a
+  // starvation reported 30-57 ms of real DMA content against a healthy 110 ms, and played 50-80 ms
+  // behind their peers -- persistently, and invisibly to every frame-based metric on the device.
+  const size_t dma = this->dma_resident_bytes_.load(std::memory_order_relaxed);
   if (this->audio_ring_buffer_.use_count() > 0) {
     std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->audio_ring_buffer_.lock();
     if (temp_ring_buffer != nullptr) {
-      bytes = temp_ring_buffer->available();
+      bytes = temp_ring_buffer->available() + dma;
       return true;
     }
+  }
+  if (dma > 0) {
+    // Task running with no ring yet: the DMA still holds (padded) audio
+    bytes = dma;
+    return true;
   }
   return false;
 }
@@ -310,6 +323,8 @@ esp_err_t I2SAudioSpeakerBase::init_i2s_channel_(const i2s_chan_config_t &chan_c
 }
 
 void I2SAudioSpeakerBase::stop_i2s_driver_() {
+  // Descriptors go away with the channel; stop claiming their latency
+  this->dma_resident_bytes_.store(0, std::memory_order_relaxed);
   if (this->tx_handle_ != nullptr) {
     i2s_channel_disable(this->tx_handle_);
     i2s_del_channel(this->tx_handle_);
