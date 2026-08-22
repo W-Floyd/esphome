@@ -284,11 +284,25 @@ bool SourceSpeaker::has_buffered_data() const {
 bool SourceSpeaker::buffered_bytes(size_t &bytes) const {
   // This source's own queue only. What the mixer has already combined and passed to the output
   // speaker is that speaker's to report, so a caller wanting total latency sums the two.
-  if (this->audio_source_.use_count() == 0) {
-    return false;
+  //
+  // Gate on the RING BUFFER, not on audio_source_. play() writes into ring_buffer_, while
+  // audio_source_ is the consumer-side wrapper the mixer task constructs in start_() -- so a
+  // writer can legitimately have queued audio before audio_source_ exists. Gating on the latter
+  // reported "cannot tell" while the ring held data, which reads identically to an empty pipeline
+  // at the call site.
+  if (this->audio_source_.use_count() > 0) {
+    // Complete: RingBufferAudioSource::buffered_bytes() already includes ring_buffer_->available()
+    // alongside its own in-flight exposure and queued item, so this must not be added to it.
+    bytes = this->audio_source_->buffered_bytes();
+    return true;
   }
-  bytes = this->audio_source_->buffered_bytes();
-  return true;
+  std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
+  if (temp_ring_buffer != nullptr) {
+    // No consumer wrapper yet, so nothing can be in flight beyond the ring itself
+    bytes = temp_ring_buffer->available();
+    return true;
+  }
+  return false;
 }
 
 void SourceSpeaker::set_mute_state(bool mute_state) {
