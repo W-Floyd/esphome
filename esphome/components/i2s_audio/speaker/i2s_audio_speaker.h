@@ -10,6 +10,8 @@
 
 #include "esphome/components/audio/audio.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
+
+#include <atomic>
 #include "esphome/components/speaker/speaker.h"
 
 #include "esphome/core/component.h"
@@ -76,6 +78,8 @@ class I2SAudioSpeakerBase : public I2SAudioOut, public speaker::Speaker, public 
   size_t play(const uint8_t *data, size_t length) override { return play(data, length, 0); }
 
   bool has_buffered_data() const override;
+  bool render_latency(uint32_t &microseconds) const override;
+  bool buffered_audio(uint32_t &microseconds) const override;
 
   /// @brief Sets the volume of the speaker. Uses the speaker's configured audio dac component. If unavailble, it is
   /// implemented as a software volume control. Overrides the default setter to convert the floating point volume to a
@@ -150,6 +154,26 @@ class I2SAudioSpeakerBase : public I2SAudioOut, public speaker::Speaker, public 
   std::weak_ptr<ring_buffer::RingBuffer> audio_ring_buffer_;
 
   uint32_t buffer_duration_ms_;
+  // How long the audio this speaker holds will take to render, in microseconds, PUBLISHED BY THE
+  // SPEAKER TASK. Readers load it; they never reach into the ring buffer or the audio source, both of
+  // which are single-consumer-thread objects (see RingBufferAudioSource's contract). Publishing one
+  // value also makes the sum atomic, so a reader cannot observe the ring already drained while the
+  // DMA count has not yet been updated.
+  //
+  // Includes the DMA descriptors' silence padding, and that is the point. Lockstep write records
+  // count only REAL frames, so the played-frames callback -- and any accounting built on it -- cannot
+  // see padding, even though padding still costs time to render.
+  //
+  // Staleness is bounded by one task iteration (one DMA buffer, DMA_BUFFER_DURATION_MS). Zeroed
+  // whenever the task is not running, so a stopped speaker reports a true zero rather than a stale
+  // span.
+  std::atomic<uint32_t> render_latency_us_{0};
+  // The caller's own audio still held, excluding DMA silence padding. Published beside
+  // render_latency_us_ by the same task, so the two are consistent with each other.
+  std::atomic<uint32_t> buffered_audio_us_{0};
+  // Output-format bytes resident in the DMA descriptors, for the task's own use when it recomputes
+  // render_latency_us_. 0 until the descriptors are preloaded.
+  std::atomic<size_t> dma_resident_bytes_{0};
 
   optional<uint32_t> timeout_;
 

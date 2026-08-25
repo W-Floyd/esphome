@@ -306,6 +306,51 @@ bool ResamplerSpeaker::has_buffered_data() const {
   return (has_ring_buffer_data || this->output_speaker_->has_buffered_data());
 }
 
+bool ResamplerSpeaker::render_latency(uint32_t &microseconds) const {
+  // A duration is the only thing that can be summed here. This speaker's own ring holds audio at the
+  // INPUT rate while everything downstream runs at the target rate, so a frame count on one side
+  // means a different span of time from the same count on the other -- which is why the base API
+  // reports latency rather than bytes or frames.
+  // Unlike the i2s and mixer speakers this cannot publish a single snapshot: it owns no task of its
+  // own, so there is no consumer thread to compute a total from. The ring read and the downstream
+  // load are therefore microseconds apart, and audio moving between them can be counted twice or
+  // missed -- bounded by whatever the resampler transfers in one pass. The live ring read matches
+  // what has_buffered_data() already does here.
+  uint32_t downstream_us = 0;
+  if (this->output_speaker_ == nullptr || !this->output_speaker_->render_latency(downstream_us)) {
+    return false;
+  }
+  uint32_t own_us = 0;
+  if (this->requires_resampling_()) {
+    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
+    if (temp_ring_buffer) {
+      own_us = this->audio_stream_info_.frames_to_microseconds(
+          this->audio_stream_info_.bytes_to_frames(temp_ring_buffer->available()));
+    }
+  }
+  microseconds = own_us + downstream_us;
+  return true;
+}
+
+bool ResamplerSpeaker::buffered_audio(uint32_t &microseconds) const {
+  // The resampler's own ring holds nothing but caller audio, so the only difference from
+  // render_latency() is what the output speaker contributes.
+  uint32_t downstream_us = 0;
+  if (this->output_speaker_ == nullptr || !this->output_speaker_->buffered_audio(downstream_us)) {
+    return false;
+  }
+  uint32_t own_us = 0;
+  if (this->requires_resampling_()) {
+    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
+    if (temp_ring_buffer) {
+      own_us = this->audio_stream_info_.frames_to_microseconds(
+          this->audio_stream_info_.bytes_to_frames(temp_ring_buffer->available()));
+    }
+  }
+  microseconds = own_us + downstream_us;
+  return true;
+}
+
 void ResamplerSpeaker::set_mute_state(bool mute_state) {
   this->mute_state_ = mute_state;
   this->output_speaker_->set_mute_state(mute_state);

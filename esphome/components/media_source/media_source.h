@@ -45,6 +45,26 @@ class MediaSourceListener {
   /// @brief Notify listener of state changes
   virtual void report_state(MediaSourceState state) = 0;
 
+  /// @brief How long from now until audio written through this listener would be rendered, if it can
+  /// report it.
+  ///
+  /// A source that schedules playback needs to know how far behind the audio it hands over will be
+  /// rendered. It can count what it wrote and be told what was played, but the fill between those two
+  /// points is otherwise invisible to it, so a pipeline restart at an unobserved level leaves playback
+  /// offset by that amount with no metric reflecting it.
+  ///
+  /// This is latency, not audio remaining: it includes buffering that holds no audio of this source's
+  /// at all, so it does not fall to zero as the queue empties. See Speaker::render_latency().
+  ///
+  /// @param microseconds Set to the latency on success. Untouched on failure.
+  /// @return false when the listener cannot report -- distinct from reporting zero.
+  virtual bool render_latency(uint32_t & /*microseconds*/) const { return false; }
+
+  /// @brief How much of THIS SOURCE'S OWN audio is still buffered downstream, if the listener can
+  /// report it. Excludes padding and other audio the source did not write, so it is the quantity a
+  /// source compares against its own written-minus-played count. See Speaker::buffered_audio().
+  virtual bool buffered_audio(uint32_t & /*microseconds*/) const { return false; }
+
   // Callbacks from smart sources requesting the orchestrator to change volume, mute, or start a new URI.
   // Simple sources never invoke these.
   /// @brief Request the orchestrator to change volume
@@ -117,6 +137,24 @@ class MediaSource {
       return this->listener_->write_audio(data, length, timeout_ms, stream_info);
     }
     return 0;
+  }
+
+  /// @brief Queries render latency downstream of the listener (see MediaSourceListener::render_latency)
+  /// @param microseconds Set to the latency on success. Untouched on failure.
+  /// @return false when there is no listener, or it cannot report
+  bool output_render_latency(uint32_t &microseconds) const {
+    if (this->listener_ != nullptr) {
+      return this->listener_->render_latency(microseconds);
+    }
+    return false;
+  }
+
+  /// @brief Queries buffered own-audio downstream (see MediaSourceListener::buffered_audio)
+  bool output_buffered_audio(uint32_t &microseconds) const {
+    if (this->listener_ != nullptr) {
+      return this->listener_->buffered_audio(microseconds);
+    }
+    return false;
   }
 
   // === Callbacks: Orchestrator -> Source ===

@@ -151,6 +151,19 @@ void Router::finish() {
 
 bool Router::has_buffered_data() const { return this->get_active_output()->has_buffered_data(); }
 
+// Pure passthrough: the router holds no audio of its own, so the active output's latency is the
+// whole answer. Forwarding matters because the base default reports "cannot tell", which would
+// hide a perfectly capable speaker behind a router.
+bool Router::render_latency(uint32_t &microseconds) const {
+  speaker::Speaker *out = this->get_active_output();
+  return out != nullptr && out->render_latency(microseconds);
+}
+
+bool Router::buffered_audio(uint32_t &microseconds) const {
+  speaker::Speaker *out = this->get_active_output();
+  return out != nullptr && out->buffered_audio(microseconds);
+}
+
 void Router::set_pause_state(bool pause_state) {
   this->cached_pause_ = pause_state;
   this->get_active_output()->set_pause_state(pause_state);

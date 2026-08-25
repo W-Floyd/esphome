@@ -99,13 +99,18 @@ void I2SAudioSpeaker::run_speaker_task() {
   // allocated so preload, silence padding, and the write/event lockstep all match it exactly. The channel is
   // in the READY state here because start_i2s_driver() initialized it before this task was created.
   size_t dma_buffer_bytes;
+  size_t total_dma_bytes;
   i2s_chan_info_t chan_info;
   if (i2s_channel_get_info(this->tx_handle_, &chan_info) == ESP_OK && chan_info.total_dma_buf_size > 0) {
     // total_dma_buf_size spans all DMA_BUFFERS_COUNT descriptors and is an exact multiple of the count.
     dma_buffer_bytes = chan_info.total_dma_buf_size / DMA_BUFFERS_COUNT;
+    // Occupancy is published after preload, not here: until the descriptors are actually filled the
+    // channel holds nothing, and a failed setup would otherwise leave a full span reported.
+    total_dma_bytes = chan_info.total_dma_buf_size;
   } else {
     // Should not happen for a READY channel; fall back to the requested size.
     dma_buffer_bytes = this->output_stream_info_.frames_to_bytes(dma_buffer_frames(this->output_stream_info_));
+    total_dma_bytes = dma_buffer_bytes * DMA_BUFFERS_COUNT;
   }
   // dma_buffer_bytes counts output-format bytes; convert with the output stream info.
   const uint32_t frames_per_dma_buffer = this->output_stream_info_.bytes_to_frames(dma_buffer_bytes);
@@ -176,7 +181,14 @@ void I2SAudioSpeaker::run_speaker_task() {
     // Number of records currently in ``write_records_queue_`` that carry real audio. Used by graceful
     // stop to wait until every real-audio buffer has been confirmed played by an ISR event.
     uint32_t pending_real_buffers = 0;
+    // Real frames still resident in the DMA descriptors, tracked in lockstep with
+    // write_records_queue_. Separates the caller's own audio from the silence padding that shares
+    // those descriptors, which render_latency() counts and buffered_audio() must not.
+    uint32_t dma_real_frames = 0;
     uint32_t last_data_received_time = millis();
+
+    // Descriptors are preloaded and the channel is enabled, so the span really is resident now.
+    this->dma_resident_bytes_.store(total_dma_bytes, std::memory_order_relaxed);
 
     xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::TASK_RUNNING);
 
@@ -228,6 +240,7 @@ void I2SAudioSpeaker::run_speaker_task() {
           lockstep_broken = true;
           break;
         }
+        dma_real_frames -= std::min(dma_real_frames, real_frames);
         if (real_frames > 0) {
           pending_real_buffers--;
           // Real audio is packed at the start of each DMA buffer with any silence padding on the
@@ -252,6 +265,22 @@ void I2SAudioSpeaker::run_speaker_task() {
         ESP_LOGV(TAG, "Exiting: graceful stop complete");
         break;
       }
+
+      // Publish the depth from the thread that owns the source: readers must not touch
+      // audio_source (single-consumer-thread) or add byte counts across the input/output format
+      // boundary. Ring and in-flight bytes are input-format; the DMA span is output-format.
+      const uint32_t queued_us = this->current_stream_info_.frames_to_microseconds(
+          this->current_stream_info_.bytes_to_frames(audio_source->buffered_bytes()));
+      // Latency counts the WHOLE descriptor span, padding included: silence still takes time to
+      // clock out ahead of anything handed over now.
+      this->render_latency_us_.store(
+          queued_us + this->output_stream_info_.frames_to_microseconds(this->output_stream_info_.bytes_to_frames(
+                          this->dma_resident_bytes_.load(std::memory_order_relaxed))),
+          std::memory_order_release);
+      // Buffered audio counts only REAL frames, so a caller can compare it against its own
+      // pushed-minus-played without the padding appearing as a phantom discrepancy.
+      this->buffered_audio_us_.store(queued_us + this->current_stream_info_.frames_to_microseconds(dma_real_frames),
+                                     std::memory_order_release);
 
       // Compose exactly one DMA buffer's worth: drain as much real audio as the source currently
       // exposes (may take multiple fill() calls when crossing a ring buffer wrap), then pad any
@@ -334,6 +363,7 @@ void I2SAudioSpeaker::run_speaker_task() {
       // Push the matching write record. Capacity headroom in I2S_EVENT_QUEUE_COUNT guarantees this
       // succeeds even with a transient backlog of unprocessed events; if it ever fails the lockstep
       // invariant is broken and every subsequent timestamp would be silently wrong, so bail.
+      dma_real_frames += real_frames_total;
       if (xQueueSend(this->write_records_queue_, &real_frames_total, 0) != pdTRUE) {
         ESP_LOGV(TAG, "Exiting: write records queue full");
         xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::ERR_LOCKSTEP_DESYNC);
@@ -353,6 +383,12 @@ void I2SAudioSpeaker::run_speaker_task() {
     silence_allocator.deallocate(silence_buffer, dma_buffer_bytes);
     silence_buffer = nullptr;
   }
+
+  // Nothing is resident once the task is winding down; clear before signalling so a reader cannot
+  // observe a full span for a channel that no longer holds anything.
+  this->render_latency_us_.store(0, std::memory_order_release);
+  this->buffered_audio_us_.store(0, std::memory_order_release);
+  this->dma_resident_bytes_.store(0, std::memory_order_relaxed);
 
   xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::TASK_STOPPED);
 

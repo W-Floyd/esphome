@@ -62,6 +62,55 @@ class Speaker {
 
   virtual bool has_buffered_data() const = 0;
 
+  /// @brief How long from now until audio handed to this speaker would be rendered, if the platform
+  /// can report it.
+  ///
+  /// has_buffered_data() answers "any or none", which is enough to drain but not enough to schedule.
+  /// A synchronised consumer can count what it pushed and be told what was played, but the fill
+  /// sitting between those two points is otherwise invisible, so a pipeline restart at an unobserved
+  /// fill level leaves playback offset by that amount with every other metric reading nominal.
+  ///
+  /// This is LATENCY, not "audio remaining". It includes buffering that holds no caller audio at all
+  /// -- notably i2s DMA descriptors preloaded with silence, which still take time to clock out -- so
+  /// while a speaker is running it does NOT fall to zero as the queue empties. Use has_buffered_data()
+  /// to drain; a loop waiting for this to reach zero would never terminate.
+  ///
+  /// Reported as a duration because bytes and frames do not compose across a chain. A mixer may widen
+  /// a mono source to stereo, a resampler changes the frame rate outright, and the i2s slot width may
+  /// be narrower than the incoming stream, so bytes at one stage cannot be added to bytes at the next
+  /// and neither can frames across a resampler. Each stage converts its own buffers with its own
+  /// stream info and sums the results.
+  ///
+  /// Implementations that buffer on a task publish a snapshot rather than reading their queues live,
+  /// so the value is internally consistent -- never a sum of terms taken at different instants -- but
+  /// may lag by up to one iteration of that task. In steady state the latency is near-constant and
+  /// the lag costs nothing; during a transient, such as a refill after starvation, the value can
+  /// trail the truth by roughly one buffer period.
+  ///
+  /// @param microseconds Set to the latency on success. Untouched on failure. Bounded by the buffer
+  /// sizes involved, so a uint32_t is ample; it is not a general-purpose timer.
+  /// @return false only when the platform CANNOT report -- never merely because it is empty or
+  /// stopped, both of which report true with a real value. A caller doing one-shot feature detection
+  /// on a not-yet-started speaker must not conclude the platform is unsupported.
+  virtual bool render_latency(uint32_t & /*microseconds*/) const { return false; }
+
+  /// @brief How much of the CALLER'S OWN audio this speaker still holds, as a duration, if the
+  /// platform can report it.
+  ///
+  /// Distinct from render_latency() and the distinction matters. render_latency() answers "when will
+  /// audio handed over now be heard", so it counts every delay ahead of that audio -- including i2s
+  /// DMA descriptors padded with silence, which hold none of the caller's audio but still take time
+  /// to clock out. This answers "how much of what I gave you is left", which excludes that padding.
+  ///
+  /// A caller that tracks what it wrote and is told what was played needs THIS one to check its own
+  /// accounting: comparing its outstanding count against render_latency() differences two different
+  /// quantities and yields the padding as a spurious residue. It needs render_latency() to schedule.
+  /// Both, for the two different questions.
+  ///
+  /// @param microseconds Set to the duration on success. Untouched on failure.
+  /// @return false when the platform cannot report -- distinct from reporting zero.
+  virtual bool buffered_audio(uint32_t & /*microseconds*/) const { return false; }
+
   bool is_running() const { return this->state_ == STATE_RUNNING; }
   bool is_stopped() const { return this->state_ == STATE_STOPPED; }
 

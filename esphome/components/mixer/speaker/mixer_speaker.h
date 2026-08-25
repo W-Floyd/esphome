@@ -58,6 +58,8 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
   void finish() override;
 
   bool has_buffered_data() const override;
+  bool render_latency(uint32_t &microseconds) const override;
+  bool buffered_audio(uint32_t &microseconds) const override;
 
   /// @brief Mute state changes are passed to the parent's output speaker
   void set_mute_state(bool mute_state) override;
@@ -98,6 +100,14 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
 
   MixerSpeaker *parent_;
 
+  // This source's ENTIRE render latency -- its own queue plus everything downstream -- in
+  // microseconds, PUBLISHED AS ONE VALUE BY THE MIXER TASK. Deliberately a single atomic rather than
+  // a term the reader sums with the parent's: two loads could straddle a mixer iteration and produce
+  // a total that was never true at any instant. RingBufferAudioSource is also single-consumer-thread
+  // by contract, so a reader must not compute its own term. Staleness is bounded by one iteration.
+  std::atomic<uint32_t> render_latency_us_{0};
+  // Same construction, counting only the caller's own audio -- see Speaker::buffered_audio().
+  std::atomic<uint32_t> buffered_audio_us_{0};
   std::shared_ptr<audio::RingBufferAudioSource> audio_source_;
   std::weak_ptr<ring_buffer::RingBuffer> ring_buffer_;
 
@@ -120,6 +130,11 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
 
 class MixerSpeaker final : public Component {
  public:
+  /// @brief Latency of everything past the source rings -- the task-local output transfer buffer
+  /// plus the output speaker -- in microseconds. Published by the mixer task once per iteration.
+  uint32_t get_downstream_latency_us() const { return this->downstream_latency_us_.load(std::memory_order_acquire); }
+  uint32_t get_downstream_audio_us() const { return this->downstream_audio_us_.load(std::memory_order_acquire); }
+
   void dump_config() override;
   void setup() override;
   void loop() override;
@@ -161,6 +176,11 @@ class MixerSpeaker final : public Component {
 
   StaticTask task_;
 
+  // Everything past the source rings -- the task-local output transfer buffer plus the output
+  // speaker -- as a duration, published by the mixer task. Held here rather than computed on demand
+  // because the transfer buffer is task-local and unreachable from any other thread.
+  std::atomic<uint32_t> downstream_latency_us_{0};
+  std::atomic<uint32_t> downstream_audio_us_{0};
   optional<audio::AudioStreamInfo> audio_stream_info_;
 
   std::atomic<uint32_t> frames_in_pipeline_{0};  // Frames written to output but not yet played
