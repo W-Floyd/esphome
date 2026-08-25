@@ -67,6 +67,13 @@ class DepthPublisher {
     // and reporting failure is more useful than spinning.
     for (int attempt = 0; attempt < 4; attempt++) {
       const uint32_t before = this->seq_.load(std::memory_order_acquire);
+      if (before == 0) {
+        // Never published. A speaker that has not started holds a zero-initialised snapshot, and
+        // returning that as a real reading hands the caller an as_of of 0 -- which a composing stage
+        // adopts as "the oldest instant in the total", stamping the composite with the epoch.
+        // Measured on a freshly started mixer as a reported age of 10 s.
+        return false;
+      }
       if (before & 1u) {
         continue;  // publish in progress
       }

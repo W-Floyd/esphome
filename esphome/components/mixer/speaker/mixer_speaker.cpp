@@ -552,13 +552,19 @@ void MixerSpeaker::audio_mixer_task(void *params) {
       int64_t downstream_as_of_us = esp_timer_get_time();
       if (this_mixer->output_speaker_ != nullptr) {
         audio::AudioDepth sink_latency, sink_audio;
+        // Guard the instant as well as the value: only a POSITIVE as_of is a real sampling instant,
+        // and taking the min against a zero would stamp the composite with the epoch.
         if (this_mixer->output_speaker_->render_latency(sink_latency)) {
           sink_us = sink_latency.microseconds;
-          downstream_as_of_us = std::min(downstream_as_of_us, sink_latency.as_of_us);
+          if (sink_latency.as_of_us > 0) {
+            downstream_as_of_us = std::min(downstream_as_of_us, sink_latency.as_of_us);
+          }
         }
         if (this_mixer->output_speaker_->buffered_audio(sink_audio)) {
           sink_audio_us = sink_audio.microseconds;
-          downstream_as_of_us = std::min(downstream_as_of_us, sink_audio.as_of_us);
+          if (sink_audio.as_of_us > 0) {
+            downstream_as_of_us = std::min(downstream_as_of_us, sink_audio.as_of_us);
+          }
         }
       }
       this_mixer->downstream_as_of_us_ = downstream_as_of_us;
