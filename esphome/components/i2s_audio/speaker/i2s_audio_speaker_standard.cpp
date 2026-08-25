@@ -272,15 +272,17 @@ void I2SAudioSpeaker::run_speaker_task() {
       const uint32_t queued_us = this->current_stream_info_.frames_to_microseconds(
           this->current_stream_info_.bytes_to_frames(audio_source->buffered_bytes()));
       // Latency counts the WHOLE descriptor span, padding included: silence still takes time to
-      // clock out ahead of anything handed over now.
-      this->render_latency_us_.store(
+      // clock out ahead of anything handed over now. Buffered audio counts only REAL frames, so a
+      // caller can compare it against its own pushed-minus-played without the padding appearing as a
+      // phantom discrepancy.
+      //
+      // Stamped with the instant both terms were sampled -- now, a few microseconds after the ring
+      // read above and before this iteration writes anything. A reader is up to one DMA buffer late
+      // by the time it looks, and the only way it can correct for that is to be told when this was.
+      this->depth_.publish(
           queued_us + this->output_stream_info_.frames_to_microseconds(this->output_stream_info_.bytes_to_frames(
                           this->dma_resident_bytes_.load(std::memory_order_relaxed))),
-          std::memory_order_release);
-      // Buffered audio counts only REAL frames, so a caller can compare it against its own
-      // pushed-minus-played without the padding appearing as a phantom discrepancy.
-      this->buffered_audio_us_.store(queued_us + this->current_stream_info_.frames_to_microseconds(dma_real_frames),
-                                     std::memory_order_release);
+          queued_us + this->current_stream_info_.frames_to_microseconds(dma_real_frames), esp_timer_get_time());
 
       // Compose exactly one DMA buffer's worth: drain as much real audio as the source currently
       // exposes (may take multiple fill() calls when crossing a ring buffer wrap), then pad any
@@ -386,8 +388,7 @@ void I2SAudioSpeaker::run_speaker_task() {
 
   // Nothing is resident once the task is winding down; clear before signalling so a reader cannot
   // observe a full span for a channel that no longer holds anything.
-  this->render_latency_us_.store(0, std::memory_order_release);
-  this->buffered_audio_us_.store(0, std::memory_order_release);
+  this->depth_.reset(esp_timer_get_time());
   this->dma_resident_bytes_.store(0, std::memory_order_relaxed);
 
   xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::TASK_STOPPED);

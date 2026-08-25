@@ -3,10 +3,93 @@
 #include "esphome/core/defines.h"
 #include "esphome/core/helpers.h"  // for ESPDEPRECATED
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
 namespace esphome::audio {
+
+/// @brief A depth reading and the instant it describes.
+///
+/// The instant is not decoration. A speaker that buffers on a task publishes a snapshot, so it stamps
+/// when it SAMPLED, which is in the past by up to one iteration of that task. A consumer differencing
+/// that against its own written-minus-played accumulator is then comparing a value from ``as_of_us``
+/// with a value from now, and every frame that entered or left in between shows up as a disagreement
+/// that is not one. Measured on a client with a mixer in the chain, the artefact was quantised in whole
+/// audio chunks -- 26 ms steps -- with a mean that wandered tens of milliseconds over hours, which is
+/// far larger than the accounting errors the comparison exists to catch.
+///
+/// So a consumer must evaluate its own accounting AT ``as_of_us`` rather than at read time. Reporting
+/// the instant is what makes that possible; without it the comparison cannot be made correctly at all.
+struct AudioDepth {
+  /// The duration. Untouched unless the read succeeded.
+  uint32_t microseconds{0};
+  /// esp_timer time the reading describes. A live reader stamps now; a snapshot publisher stamps when
+  /// it sampled. A stage that sums its own buffers with a downstream reading reports the OLDEST instant
+  /// contributing to the total, since that is the one the drain has to be measured from.
+  int64_t as_of_us{0};
+};
+
+/// @brief Single-writer, multi-reader store for the two depth readings a speaker publishes.
+///
+/// A seqlock rather than a handful of independent atomics, because the values must be observed as ONE
+/// instant. Pairing a duration sampled after a consume with an ``as_of_us`` sampled before it would
+/// under-state the age, which is precisely the error AudioDepth exists to remove -- so a reader is
+/// given a coherent snapshot or told it failed, never a mixture.
+///
+/// The writer must be a single task. That is already true of every speaker publishing here: the values
+/// are computed from ring buffers and audio sources whose contract is single-consumer-thread, so there
+/// is exactly one thread that may compute them.
+class DepthPublisher {
+ public:
+  /// Publishes both readings and the instant they describe. Call from the owning task only.
+  void publish(uint32_t render_us, uint32_t audio_us, int64_t as_of_us) {
+    const uint32_t seq = this->seq_.load(std::memory_order_relaxed);
+    this->seq_.store(seq + 1, std::memory_order_release);  // odd: publish in progress
+    this->render_us_.store(render_us, std::memory_order_relaxed);
+    this->audio_us_.store(audio_us, std::memory_order_relaxed);
+    this->as_of_lo_.store(static_cast<uint32_t>(static_cast<uint64_t>(as_of_us)), std::memory_order_relaxed);
+    this->as_of_hi_.store(static_cast<uint32_t>(static_cast<uint64_t>(as_of_us) >> 32), std::memory_order_relaxed);
+    this->seq_.store(seq + 2, std::memory_order_release);  // even: stable
+  }
+
+  /// Publishes a true zero. A stopped speaker holds nothing, which is an answer rather than a refusal,
+  /// so callers probing a not-yet-started speaker must not conclude the platform cannot report.
+  void reset(int64_t as_of_us) { this->publish(0, 0, as_of_us); }
+
+  bool read_render(AudioDepth &depth) const { return this->read_(depth, this->render_us_); }
+  bool read_audio(AudioDepth &depth) const { return this->read_(depth, this->audio_us_); }
+
+ private:
+  bool read_(AudioDepth &depth, const std::atomic<uint32_t> &field) const {
+    // Bounded retry. A publisher runs on a task cadence measured in tens of milliseconds, so a reader
+    // that loses four races in a row is not racing -- it is looking at a writer stopped mid-publish,
+    // and reporting failure is more useful than spinning.
+    for (int attempt = 0; attempt < 4; attempt++) {
+      const uint32_t before = this->seq_.load(std::memory_order_acquire);
+      if (before & 1u) {
+        continue;  // publish in progress
+      }
+      const uint32_t us = field.load(std::memory_order_relaxed);
+      const uint64_t lo = this->as_of_lo_.load(std::memory_order_relaxed);
+      const uint64_t hi = this->as_of_hi_.load(std::memory_order_relaxed);
+      if (this->seq_.load(std::memory_order_acquire) == before) {
+        depth.microseconds = us;
+        depth.as_of_us = static_cast<int64_t>((hi << 32) | lo);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  std::atomic<uint32_t> seq_{0};
+  // Plain values guarded by seq_, split into 32-bit halves because a 64-bit atomic is not lock-free on
+  // the targets this runs on and a hidden libatomic mutex has no business in a speaker task.
+  std::atomic<uint32_t> render_us_{0};
+  std::atomic<uint32_t> audio_us_{0};
+  std::atomic<uint32_t> as_of_lo_{0};
+  std::atomic<uint32_t> as_of_hi_{0};
+};
 
 class AudioStreamInfo {
   /* Class to respresent important parameters of the audio stream that also provides helper function to convert between

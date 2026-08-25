@@ -306,7 +306,7 @@ bool ResamplerSpeaker::has_buffered_data() const {
   return (has_ring_buffer_data || this->output_speaker_->has_buffered_data());
 }
 
-bool ResamplerSpeaker::render_latency(uint32_t &microseconds) const {
+bool ResamplerSpeaker::render_latency(audio::AudioDepth &depth) const {
   // A duration is the only thing that can be summed here. This speaker's own ring holds audio at the
   // INPUT rate while everything downstream runs at the target rate, so a frame count on one side
   // means a different span of time from the same count on the other -- which is why the base API
@@ -316,39 +316,40 @@ bool ResamplerSpeaker::render_latency(uint32_t &microseconds) const {
   // load are therefore microseconds apart, and audio moving between them can be counted twice or
   // missed -- bounded by whatever the resampler transfers in one pass. The live ring read matches
   // what has_buffered_data() already does here.
-  uint32_t downstream_us = 0;
-  if (this->output_speaker_ == nullptr || !this->output_speaker_->render_latency(downstream_us)) {
+  //
+  // The instant carried up is the downstream one, unchanged: the ring is read live so its term is
+  // current, and the composite is only as current as the sink's snapshot beneath it.
+  audio::AudioDepth downstream;
+  if (this->output_speaker_ == nullptr || !this->output_speaker_->render_latency(downstream)) {
     return false;
   }
-  uint32_t own_us = 0;
-  if (this->requires_resampling_()) {
-    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
-    if (temp_ring_buffer) {
-      own_us = this->audio_stream_info_.frames_to_microseconds(
-          this->audio_stream_info_.bytes_to_frames(temp_ring_buffer->available()));
-    }
-  }
-  microseconds = own_us + downstream_us;
+  depth.microseconds = this->own_buffered_us_() + downstream.microseconds;
+  depth.as_of_us = downstream.as_of_us;
   return true;
 }
 
-bool ResamplerSpeaker::buffered_audio(uint32_t &microseconds) const {
+bool ResamplerSpeaker::buffered_audio(audio::AudioDepth &depth) const {
   // The resampler's own ring holds nothing but caller audio, so the only difference from
   // render_latency() is what the output speaker contributes.
-  uint32_t downstream_us = 0;
-  if (this->output_speaker_ == nullptr || !this->output_speaker_->buffered_audio(downstream_us)) {
+  audio::AudioDepth downstream;
+  if (this->output_speaker_ == nullptr || !this->output_speaker_->buffered_audio(downstream)) {
     return false;
   }
-  uint32_t own_us = 0;
-  if (this->requires_resampling_()) {
-    std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
-    if (temp_ring_buffer) {
-      own_us = this->audio_stream_info_.frames_to_microseconds(
-          this->audio_stream_info_.bytes_to_frames(temp_ring_buffer->available()));
-    }
-  }
-  microseconds = own_us + downstream_us;
+  depth.microseconds = this->own_buffered_us_() + downstream.microseconds;
+  depth.as_of_us = downstream.as_of_us;
   return true;
+}
+
+uint32_t ResamplerSpeaker::own_buffered_us_() const {
+  if (!this->requires_resampling_()) {
+    return 0;
+  }
+  std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
+  if (!temp_ring_buffer) {
+    return 0;
+  }
+  return this->audio_stream_info_.frames_to_microseconds(
+      this->audio_stream_info_.bytes_to_frames(temp_ring_buffer->available()));
 }
 
 void ResamplerSpeaker::set_mute_state(bool mute_state) {

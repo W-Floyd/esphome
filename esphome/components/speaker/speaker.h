@@ -83,16 +83,17 @@ class Speaker {
   ///
   /// Implementations that buffer on a task publish a snapshot rather than reading their queues live,
   /// so the value is internally consistent -- never a sum of terms taken at different instants -- but
-  /// may lag by up to one iteration of that task. In steady state the latency is near-constant and
-  /// the lag costs nothing; during a transient, such as a refill after starvation, the value can
-  /// trail the truth by roughly one buffer period.
+  /// describes a moment that has already passed. That is why the reading carries the instant it
+  /// describes: see audio::AudioDepth, and read it before differencing this against anything of your
+  /// own, because comparing it against a live counter is measurably wrong.
   ///
-  /// @param microseconds Set to the latency on success. Untouched on failure. Bounded by the buffer
-  /// sizes involved, so a uint32_t is ample; it is not a general-purpose timer.
+  /// @param depth Set to the latency and the instant it describes, on success. Untouched on failure.
+  /// The duration is bounded by the buffer sizes involved, so a uint32_t is ample; it is not a
+  /// general-purpose timer.
   /// @return false only when the platform CANNOT report -- never merely because it is empty or
   /// stopped, both of which report true with a real value. A caller doing one-shot feature detection
   /// on a not-yet-started speaker must not conclude the platform is unsupported.
-  virtual bool render_latency(uint32_t & /*microseconds*/) const { return false; }
+  virtual bool render_latency(audio::AudioDepth & /*depth*/) const { return false; }
 
   /// @brief How much of the CALLER'S OWN audio this speaker still holds, as a duration, if the
   /// platform can report it.
@@ -107,9 +108,16 @@ class Speaker {
   /// quantities and yields the padding as a spurious residue. It needs render_latency() to schedule.
   /// Both, for the two different questions.
   ///
-  /// @param microseconds Set to the duration on success. Untouched on failure.
+  /// The audit only works if both sides are evaluated at the same moment. This reading describes
+  /// ``depth.as_of_us``, not now, so a caller must compare it against what its own accounting said AT
+  /// that instant. Differencing it against a live written-minus-played counter instead produces a
+  /// disagreement quantised in whole audio chunks, with a mean that wanders over hours -- an artefact
+  /// of the sampling, an order of magnitude larger than the accounting errors being looked for, and
+  /// indistinguishable from them if the instant is ignored.
+  ///
+  /// @param depth Set to the duration and the instant it describes, on success. Untouched on failure.
   /// @return false when the platform cannot report -- distinct from reporting zero.
-  virtual bool buffered_audio(uint32_t & /*microseconds*/) const { return false; }
+  virtual bool buffered_audio(audio::AudioDepth & /*depth*/) const { return false; }
 
   bool is_running() const { return this->state_ == STATE_RUNNING; }
   bool is_stopped() const { return this->state_ == STATE_STOPPED; }

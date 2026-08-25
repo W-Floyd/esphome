@@ -29,8 +29,8 @@ class Router final : public Component, public speaker::Speaker {
   void finish() override;
 
   bool has_buffered_data() const override;
-  bool render_latency(uint32_t &microseconds) const override;
-  bool buffered_audio(uint32_t &microseconds) const override;
+  bool render_latency(audio::AudioDepth &depth) const override;
+  bool buffered_audio(audio::AudioDepth &depth) const override;
 
   void set_pause_state(bool pause_state) override;
   bool get_pause_state() const override { return this->cached_pause_; }

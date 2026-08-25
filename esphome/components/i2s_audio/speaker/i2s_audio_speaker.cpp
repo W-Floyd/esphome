@@ -218,18 +218,15 @@ bool I2SAudioSpeakerBase::has_buffered_data() const {
   return false;
 }
 
-bool I2SAudioSpeakerBase::render_latency(uint32_t &microseconds) const {
-  // Published by the speaker task; see render_latency_us_ for why this is a snapshot rather than a live
-  // read of the ring buffer and audio source. Zero while stopped is a true zero, not "unknown", so
-  // a caller probing before playback does not conclude the platform is unsupported.
-  microseconds = this->render_latency_us_.load(std::memory_order_acquire);
-  return true;
+bool I2SAudioSpeakerBase::render_latency(audio::AudioDepth &depth) const {
+  // Published by the speaker task; see depth_ for why this is a snapshot rather than a live read of the
+  // ring buffer and audio source. Zero while stopped is a true zero, not "unknown", so a caller probing
+  // before playback does not conclude the platform is unsupported. A failure here means only that the
+  // reader lost four races with the publisher, which is a stalled task rather than an unsupported one.
+  return this->depth_.read_render(depth);
 }
 
-bool I2SAudioSpeakerBase::buffered_audio(uint32_t &microseconds) const {
-  microseconds = this->buffered_audio_us_.load(std::memory_order_acquire);
-  return true;
-}
+bool I2SAudioSpeakerBase::buffered_audio(audio::AudioDepth &depth) const { return this->depth_.read_audio(depth); }
 
 void I2SAudioSpeakerBase::speaker_task(void *params) {
   I2SAudioSpeakerBase *this_speaker = (I2SAudioSpeakerBase *) params;

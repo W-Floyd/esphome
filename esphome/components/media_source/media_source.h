@@ -56,14 +56,18 @@ class MediaSourceListener {
   /// This is latency, not audio remaining: it includes buffering that holds no audio of this source's
   /// at all, so it does not fall to zero as the queue empties. See Speaker::render_latency().
   ///
-  /// @param microseconds Set to the latency on success. Untouched on failure.
+  /// @param depth Set to the latency and the instant it describes, on success. Untouched on failure.
   /// @return false when the listener cannot report -- distinct from reporting zero.
-  virtual bool render_latency(uint32_t & /*microseconds*/) const { return false; }
+  virtual bool render_latency(audio::AudioDepth & /*depth*/) const { return false; }
 
   /// @brief How much of THIS SOURCE'S OWN audio is still buffered downstream, if the listener can
   /// report it. Excludes padding and other audio the source did not write, so it is the quantity a
   /// source compares against its own written-minus-played count. See Speaker::buffered_audio().
-  virtual bool buffered_audio(uint32_t & /*microseconds*/) const { return false; }
+  ///
+  /// The reading describes ``depth.as_of_us``, not now. A source auditing its own accounting must
+  /// evaluate that accounting at the same instant; differencing this against a live counter measures
+  /// the sampling phase rather than the accounting.
+  virtual bool buffered_audio(audio::AudioDepth & /*depth*/) const { return false; }
 
   // Callbacks from smart sources requesting the orchestrator to change volume, mute, or start a new URI.
   // Simple sources never invoke these.
@@ -142,17 +146,17 @@ class MediaSource {
   /// @brief Queries render latency downstream of the listener (see MediaSourceListener::render_latency)
   /// @param microseconds Set to the latency on success. Untouched on failure.
   /// @return false when there is no listener, or it cannot report
-  bool output_render_latency(uint32_t &microseconds) const {
+  bool output_render_latency(audio::AudioDepth &depth) const {
     if (this->listener_ != nullptr) {
-      return this->listener_->render_latency(microseconds);
+      return this->listener_->render_latency(depth);
     }
     return false;
   }
 
   /// @brief Queries buffered own-audio downstream (see MediaSourceListener::buffered_audio)
-  bool output_buffered_audio(uint32_t &microseconds) const {
+  bool output_buffered_audio(audio::AudioDepth &depth) const {
     if (this->listener_ != nullptr) {
-      return this->listener_->buffered_audio(microseconds);
+      return this->listener_->buffered_audio(depth);
     }
     return false;
   }

@@ -25,20 +25,20 @@ size_t SourceBinding::write_audio(const uint8_t *data, size_t length, uint32_t t
 // THREAD CONTEXT: Called from main loop (media source's loop() calls set_state_ which calls report_state)
 // THREAD CONTEXT: Called from the media source's task, same as write_audio(). Reads the pipeline's
 // speaker pointer, which is fixed at setup, and defers to that speaker's own thread safety.
-bool SourceBinding::render_latency(uint32_t &microseconds) const {
+bool SourceBinding::render_latency(audio::AudioDepth &depth) const {
   speaker::Speaker *spk = this->player->get_pipeline_speaker_(this->pipeline);
   if (spk == nullptr) {
     return false;
   }
-  return spk->render_latency(microseconds);
+  return spk->render_latency(depth);
 }
 
-bool SourceBinding::buffered_audio(uint32_t &microseconds) const {
+bool SourceBinding::buffered_audio(audio::AudioDepth &depth) const {
   speaker::Speaker *spk = this->player->get_pipeline_speaker_(this->pipeline);
   if (spk == nullptr) {
     return false;
   }
-  return spk->buffered_audio(microseconds);
+  return spk->buffered_audio(depth);
 }
 
 void SourceBinding::report_state(media_source::MediaSourceState state) {

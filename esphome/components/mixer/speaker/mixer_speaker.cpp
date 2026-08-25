@@ -7,6 +7,8 @@
 #include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
+#include "esp_timer.h"
+
 #include <mixer.h>        // esp-audio-libs
 #include <pcm_convert.h>  // esp-audio-libs
 
@@ -295,10 +297,10 @@ void SourceSpeaker::set_volume(float volume) {
 
 float SourceSpeaker::get_volume() { return this->parent_->get_output_speaker()->get_volume(); }
 
-bool SourceSpeaker::render_latency(uint32_t &microseconds) const {
-  // One load of a total the mixer task published in a single store, so the reader cannot observe a
-  // mix of instants, and never reaches into the source (single-consumer-thread) or the task-local
-  // transfer buffer.
+bool SourceSpeaker::render_latency(audio::AudioDepth &depth) const {
+  // One coherent read of a total the mixer task published in a single seqlock section, so the reader
+  // cannot observe a mix of instants, and never reaches into the source (single-consumer-thread) or
+  // the task-local transfer buffer.
   //
   // Durations are also the only thing that CAN be combined here: this source's queue is in its own
   // stream format while everything downstream is in the mixer's output format, and queue mode allows
@@ -307,16 +309,14 @@ bool SourceSpeaker::render_latency(uint32_t &microseconds) const {
   if (this->parent_ == nullptr) {
     return false;
   }
-  microseconds = this->render_latency_us_.load(std::memory_order_acquire);
-  return true;
+  return this->depth_.read_render(depth);
 }
 
-bool SourceSpeaker::buffered_audio(uint32_t &microseconds) const {
+bool SourceSpeaker::buffered_audio(audio::AudioDepth &depth) const {
   if (this->parent_ == nullptr) {
     return false;
   }
-  microseconds = this->buffered_audio_us_.load(std::memory_order_acquire);
-  return true;
+  return this->depth_.read_audio(depth);
 }
 
 size_t SourceSpeaker::process_data_from_source(std::shared_ptr<audio::RingBufferAudioSource> &audio_source,
@@ -332,8 +332,17 @@ size_t SourceSpeaker::process_data_from_source(std::shared_ptr<audio::RingBuffer
   // single-consumer-thread by contract. Staleness is bounded by one mixer iteration.
   const uint32_t own_us = this->audio_stream_info_.frames_to_microseconds(
       this->audio_stream_info_.bytes_to_frames(audio_source->buffered_bytes()));
-  this->render_latency_us_.store(own_us + this->parent_->get_downstream_latency_us(), std::memory_order_release);
-  this->buffered_audio_us_.store(own_us + this->parent_->get_downstream_audio_us(), std::memory_order_release);
+  // Stamped with the OLDEST instant in the total, which is the sink's snapshot instant rather than
+  // now: this source's ring is read here, but the downstream terms describe a moment already past, and
+  // a total is only as current as its stalest term. Reporting `now` would tell a consumer the reading
+  // is fresh when the part of it that DRAINS is not, and the drain is what has to be corrected for.
+  //
+  // Audio moving BETWEEN stages does not change the total, so a mixed-age sum is not itself an error:
+  // only what enters at the top or renders at the bottom moves the number, and the bottom is what this
+  // instant describes.
+  this->depth_.publish(own_us + this->parent_->get_downstream_latency_us(),
+                       own_us + this->parent_->get_downstream_audio_us(),
+                       this->parent_->get_downstream_as_of_us());
 
   if (audio_source->available() > 0) {
     // Existing exposure was ducked when fill() promoted it; do not re-duck on partial-consume re-entry.
@@ -525,11 +534,25 @@ void MixerSpeaker::audio_mixer_task(void *params) {
       output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false);
 
       // Transfer buffer (output format) plus whatever the output speaker holds, as one duration.
+      //
+      // The sink's readings describe an instant of their own choosing, up to one of ITS task
+      // iterations ago. The transfer buffer is read here and now. Carry the older of the two as the
+      // age of the composite: a sink that cannot report contributes nothing, so the transfer buffer
+      // read is then the only term and now is its true instant.
       uint32_t sink_us = 0, sink_audio_us = 0;
+      int64_t downstream_as_of_us = esp_timer_get_time();
       if (this_mixer->output_speaker_ != nullptr) {
-        this_mixer->output_speaker_->render_latency(sink_us);
-        this_mixer->output_speaker_->buffered_audio(sink_audio_us);
+        audio::AudioDepth sink_latency, sink_audio;
+        if (this_mixer->output_speaker_->render_latency(sink_latency)) {
+          sink_us = sink_latency.microseconds;
+          downstream_as_of_us = std::min(downstream_as_of_us, sink_latency.as_of_us);
+        }
+        if (this_mixer->output_speaker_->buffered_audio(sink_audio)) {
+          sink_audio_us = sink_audio.microseconds;
+          downstream_as_of_us = std::min(downstream_as_of_us, sink_audio.as_of_us);
+        }
       }
+      this_mixer->downstream_as_of_us_ = downstream_as_of_us;
       // The transfer buffer holds only real mixed audio, so it counts toward both.
       this_mixer->downstream_audio_us_.store(
           this_mixer->audio_stream_info_.value().frames_to_microseconds(

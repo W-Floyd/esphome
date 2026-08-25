@@ -226,11 +226,11 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
       // Published from the consumer thread; readers never touch the source (single-consumer-thread).
       const uint32_t queued_us = this->current_stream_info_.frames_to_microseconds(
           this->current_stream_info_.bytes_to_frames(audio_source->buffered_bytes()));
-      this->render_latency_us_.store(queued_us + dma_latency_us, std::memory_order_release);
       // SPDIF pads to a whole block like the standard path, so only the ring's contents are the
-      // caller's own audio. Reporting the DMA span here too would show as a phantom discrepancy
-      // against the caller's pushed-minus-played.
-      this->buffered_audio_us_.store(queued_us, std::memory_order_release);
+      // caller's own audio. Reporting the DMA span as buffered audio too would show as a phantom
+      // discrepancy against the caller's pushed-minus-played. Stamped with the instant the ring was
+      // read, so a reader can correct for how late it is looking.
+      this->depth_.publish(queued_us + dma_latency_us, queued_us, esp_timer_get_time());
 
       uint32_t event_group_bits = xEventGroupGetBits(this->event_group_);
 
@@ -409,8 +409,7 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
 
   audio_source.reset();
 
-  this->render_latency_us_.store(0, std::memory_order_release);
-  this->buffered_audio_us_.store(0, std::memory_order_release);
+  this->depth_.reset(esp_timer_get_time());
 
   xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::TASK_STOPPED);
 

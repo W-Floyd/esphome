@@ -32,8 +32,8 @@ class ResamplerSpeaker final : public Component, public speaker::Speaker {
   bool get_pause_state() const override { return this->output_speaker_->get_pause_state(); }
 
   bool has_buffered_data() const override;
-  bool render_latency(uint32_t &microseconds) const override;
-  bool buffered_audio(uint32_t &microseconds) const override;
+  bool render_latency(audio::AudioDepth &depth) const override;
+  bool buffered_audio(audio::AudioDepth &depth) const override;
 
   /// @brief Mute state changes are passed to the parent's output speaker
   void set_mute_state(bool mute_state) override;
@@ -80,6 +80,10 @@ class ResamplerSpeaker final : public Component, public speaker::Speaker {
   void send_command_(uint32_t command_bit, bool wake_loop = false);
 
   inline bool requires_resampling_() const;
+
+  /// @brief This speaker's own ring contents as a duration, read live. Shared by the two depth
+  /// queries, which differ only in what they ask of the speaker downstream.
+  uint32_t own_buffered_us_() const;
   static void resample_task(void *params);
 
   EventGroupHandle_t event_group_{nullptr};

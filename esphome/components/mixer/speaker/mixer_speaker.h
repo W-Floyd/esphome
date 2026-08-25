@@ -58,8 +58,8 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
   void finish() override;
 
   bool has_buffered_data() const override;
-  bool render_latency(uint32_t &microseconds) const override;
-  bool buffered_audio(uint32_t &microseconds) const override;
+  bool render_latency(audio::AudioDepth &depth) const override;
+  bool buffered_audio(audio::AudioDepth &depth) const override;
 
   /// @brief Mute state changes are passed to the parent's output speaker
   void set_mute_state(bool mute_state) override;
@@ -100,14 +100,17 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
 
   MixerSpeaker *parent_;
 
-  // This source's ENTIRE render latency -- its own queue plus everything downstream -- in
-  // microseconds, PUBLISHED AS ONE VALUE BY THE MIXER TASK. Deliberately a single atomic rather than
-  // a term the reader sums with the parent's: two loads could straddle a mixer iteration and produce
-  // a total that was never true at any instant. RingBufferAudioSource is also single-consumer-thread
-  // by contract, so a reader must not compute its own term. Staleness is bounded by one iteration.
-  std::atomic<uint32_t> render_latency_us_{0};
-  // Same construction, counting only the caller's own audio -- see Speaker::buffered_audio().
-  std::atomic<uint32_t> buffered_audio_us_{0};
+  // This source's ENTIRE depth -- its own queue plus everything downstream -- PUBLISHED AS ONE
+  // SNAPSHOT BY THE MIXER TASK. Deliberately one seqlock rather than terms the reader sums with the
+  // parent's: two loads could straddle a mixer iteration and produce a total that was never true at
+  // any instant. RingBufferAudioSource is also single-consumer-thread by contract, so a reader must
+  // not compute its own term.
+  //
+  // Staleness is bounded by one iteration (TASK_DELAY_MS) and is REPORTED. That mattered in practice:
+  // a consumer differencing this against its own live written-minus-played counter disagreed by whole
+  // audio chunks, because the chunks it had pushed since the snapshot were in its accumulator and not
+  // in here. The instant is what lets it line the two up.
+  audio::DepthPublisher depth_;
   std::shared_ptr<audio::RingBufferAudioSource> audio_source_;
   std::weak_ptr<ring_buffer::RingBuffer> ring_buffer_;
 
@@ -134,6 +137,11 @@ class MixerSpeaker final : public Component {
   /// plus the output speaker -- in microseconds. Published by the mixer task once per iteration.
   uint32_t get_downstream_latency_us() const { return this->downstream_latency_us_.load(std::memory_order_acquire); }
   uint32_t get_downstream_audio_us() const { return this->downstream_audio_us_.load(std::memory_order_acquire); }
+  /// @brief The OLDEST instant contributing to the downstream terms above -- the sink's own snapshot
+  /// instant, which is older than the transfer buffer read that accompanies it. A total is only as
+  /// current as its stalest term, and the drain has to be measured from that one.
+  /// @note Mixer task only, like the setter. Never crosses a task boundary, so it needs no atomic.
+  int64_t get_downstream_as_of_us() const { return this->downstream_as_of_us_; }
 
   void dump_config() override;
   void setup() override;
@@ -181,6 +189,10 @@ class MixerSpeaker final : public Component {
   // because the transfer buffer is task-local and unreachable from any other thread.
   std::atomic<uint32_t> downstream_latency_us_{0};
   std::atomic<uint32_t> downstream_audio_us_{0};
+  // Written by the mixer task alongside the two terms above and read back by the mixer task one call
+  // later, in process_data_from_source(). It never crosses a task boundary, so it is a plain member --
+  // a 64-bit atomic is not lock-free on these targets and there is nothing here to make lock-free.
+  int64_t downstream_as_of_us_{0};
   optional<audio::AudioStreamInfo> audio_stream_info_;
 
   std::atomic<uint32_t> frames_in_pipeline_{0};  // Frames written to output but not yet played

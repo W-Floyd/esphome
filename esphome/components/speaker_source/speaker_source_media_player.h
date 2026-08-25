@@ -81,8 +81,8 @@ struct SourceBinding : public media_source::MediaSourceListener {
   size_t write_audio(const uint8_t *data, size_t length, uint32_t timeout_ms,
                      const audio::AudioStreamInfo &stream_info) override;
   void report_state(media_source::MediaSourceState state) override;
-  bool render_latency(uint32_t &microseconds) const override;
-  bool buffered_audio(uint32_t &microseconds) const override;
+  bool render_latency(audio::AudioDepth &depth) const override;
+  bool buffered_audio(audio::AudioDepth &depth) const override;
   void request_volume(float volume) override;
   void request_mute(bool is_muted) override;
   void request_play_uri(const std::string &uri) override;
