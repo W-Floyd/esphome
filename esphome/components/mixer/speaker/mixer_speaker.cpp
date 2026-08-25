@@ -530,15 +530,24 @@ void MixerSpeaker::audio_mixer_task(void *params) {
         break;
       }
 
-      // Never shift the data in the output transfer buffer to avoid unnecessary, slow data moves
-      output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false);
-
       // Transfer buffer (output format) plus whatever the output speaker holds, as one duration.
       //
-      // The sink's readings describe an instant of their own choosing, up to one of ITS task
-      // iterations ago. The transfer buffer is read here and now. Carry the older of the two as the
-      // age of the composite: a sink that cannot report contributes nothing, so the transfer buffer
-      // read is then the only term and now is its true instant.
+      // READ BEFORE THE TRANSFER BELOW, and the order is load-bearing. The sink reports a snapshot
+      // published on ITS task's cadence, so it describes an instant already past; the transfer buffer
+      // is read here and now. Reading the transfer buffer AFTER handing audio to the sink put the two
+      // terms either side of that hand-off: the audio just moved was gone from the transfer buffer and
+      // not yet in the sink's snapshot, so it was counted in NEITHER and the total dropped by whatever
+      // had moved -- about one mixer iteration's worth -- until the sink published again.
+      //
+      // Measured on hardware before this was reordered: the reported depth dipped ~30 ms on roughly a
+      // seventh of samples while the consumer's own accounting did not move at all (-30.6 ms and
+      // -28.2 ms of reported depth against -0.1 ms and -1.0 ms of accounted queue, on two clients).
+      // That read as a steady accounting split for as long as it dwelt, and the consumer's self-repair
+      // acted on it.
+      //
+      // Reading both before the transfer makes them coherent: nothing moves between stages in the
+      // window between the sink's publish and this read, because the mixer is the only thing that
+      // feeds the sink and its previous transfer predates that publish.
       uint32_t sink_us = 0, sink_audio_us = 0;
       int64_t downstream_as_of_us = esp_timer_get_time();
       if (this_mixer->output_speaker_ != nullptr) {
@@ -565,6 +574,13 @@ void MixerSpeaker::audio_mixer_task(void *params) {
               sink_us,
           std::memory_order_release);
 
+      // Hand audio to the sink only AFTER publishing the pair above, so the two terms describe the
+      // same instant. Never shift the data in the output transfer buffer to avoid unnecessary, slow
+      // data moves.
+      output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false);
+
+      // Free space is read after the transfer on purpose: this one wants the post-transfer figure,
+      // since it bounds how much this iteration may mix in.
       const uint32_t output_frames_free =
           this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->free());
 
