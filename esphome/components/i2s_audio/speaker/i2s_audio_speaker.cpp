@@ -218,6 +218,19 @@ bool I2SAudioSpeakerBase::has_buffered_data() const {
   return false;
 }
 
+bool I2SAudioSpeakerBase::render_latency(uint32_t &microseconds) const {
+  // Published by the speaker task; see render_latency_us_ for why this is a snapshot rather than a live
+  // read of the ring buffer and audio source. Zero while stopped is a true zero, not "unknown", so
+  // a caller probing before playback does not conclude the platform is unsupported.
+  microseconds = this->render_latency_us_.load(std::memory_order_acquire);
+  return true;
+}
+
+bool I2SAudioSpeakerBase::buffered_audio(uint32_t &microseconds) const {
+  microseconds = this->buffered_audio_us_.load(std::memory_order_acquire);
+  return true;
+}
+
 void I2SAudioSpeakerBase::speaker_task(void *params) {
   I2SAudioSpeakerBase *this_speaker = (I2SAudioSpeakerBase *) params;
   this_speaker->run_speaker_task();
@@ -296,6 +309,8 @@ esp_err_t I2SAudioSpeakerBase::init_i2s_channel_(const i2s_chan_config_t &chan_c
 }
 
 void I2SAudioSpeakerBase::stop_i2s_driver_() {
+  // Descriptors go away with the channel; stop claiming their latency
+  this->dma_resident_bytes_.store(0, std::memory_order_relaxed);
   if (this->tx_handle_ != nullptr) {
     i2s_channel_disable(this->tx_handle_);
     i2s_del_channel(this->tx_handle_);

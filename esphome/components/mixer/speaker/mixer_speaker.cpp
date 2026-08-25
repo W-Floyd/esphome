@@ -295,8 +295,46 @@ void SourceSpeaker::set_volume(float volume) {
 
 float SourceSpeaker::get_volume() { return this->parent_->get_output_speaker()->get_volume(); }
 
+bool SourceSpeaker::render_latency(uint32_t &microseconds) const {
+  // One load of a total the mixer task published in a single store, so the reader cannot observe a
+  // mix of instants, and never reaches into the source (single-consumer-thread) or the task-local
+  // transfer buffer.
+  //
+  // Durations are also the only thing that CAN be combined here: this source's queue is in its own
+  // stream format while everything downstream is in the mixer's output format, and queue mode allows
+  // the two to differ in channel count and sample rate. A mono source feeding a stereo mixer would
+  // double-weight the downstream term if bytes were added.
+  if (this->parent_ == nullptr) {
+    return false;
+  }
+  microseconds = this->render_latency_us_.load(std::memory_order_acquire);
+  return true;
+}
+
+bool SourceSpeaker::buffered_audio(uint32_t &microseconds) const {
+  if (this->parent_ == nullptr) {
+    return false;
+  }
+  microseconds = this->buffered_audio_us_.load(std::memory_order_acquire);
+  return true;
+}
+
 size_t SourceSpeaker::process_data_from_source(std::shared_ptr<audio::RingBufferAudioSource> &audio_source,
                                                TickType_t ticks_to_wait) {
+  // Publish the WHOLE latency in one store, before anything else in this function can return: this
+  // source's queue plus everything downstream, the latter already computed once for this iteration by
+  // the mixer task just above the loop that calls us. A reader then does a single load and cannot
+  // observe a mix of instants -- summing two atomics could catch this source after a consume but the
+  // downstream term before the matching transfer, under-reporting by up to one mix chunk, which is
+  // exactly the kind of error a one-shot re-baseline cannot recover from.
+  //
+  // Published from the thread that owns the source, because RingBufferAudioSource is
+  // single-consumer-thread by contract. Staleness is bounded by one mixer iteration.
+  const uint32_t own_us = this->audio_stream_info_.frames_to_microseconds(
+      this->audio_stream_info_.bytes_to_frames(audio_source->buffered_bytes()));
+  this->render_latency_us_.store(own_us + this->parent_->get_downstream_latency_us(), std::memory_order_release);
+  this->buffered_audio_us_.store(own_us + this->parent_->get_downstream_audio_us(), std::memory_order_release);
+
   if (audio_source->available() > 0) {
     // Existing exposure was ducked when fill() promoted it; do not re-duck on partial-consume re-entry.
     return 0;
@@ -485,6 +523,24 @@ void MixerSpeaker::audio_mixer_task(void *params) {
 
       // Never shift the data in the output transfer buffer to avoid unnecessary, slow data moves
       output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false);
+
+      // Transfer buffer (output format) plus whatever the output speaker holds, as one duration.
+      uint32_t sink_us = 0, sink_audio_us = 0;
+      if (this_mixer->output_speaker_ != nullptr) {
+        this_mixer->output_speaker_->render_latency(sink_us);
+        this_mixer->output_speaker_->buffered_audio(sink_audio_us);
+      }
+      // The transfer buffer holds only real mixed audio, so it counts toward both.
+      this_mixer->downstream_audio_us_.store(
+          this_mixer->audio_stream_info_.value().frames_to_microseconds(
+              this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->available())) +
+              sink_audio_us,
+          std::memory_order_release);
+      this_mixer->downstream_latency_us_.store(
+          this_mixer->audio_stream_info_.value().frames_to_microseconds(
+              this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->available())) +
+              sink_us,
+          std::memory_order_release);
 
       const uint32_t output_frames_free =
           this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->free());

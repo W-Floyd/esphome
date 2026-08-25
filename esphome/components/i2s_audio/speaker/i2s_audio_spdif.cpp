@@ -211,12 +211,27 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
     int64_t spdif_pending_timestamp = 0;
     uint32_t spdif_dma_event_count = 0;
 
+    // The DMA holds SPDIF_DMA_BUFFERS_COUNT blocks of SPDIF_BLOCK_SAMPLES frames, preloaded and kept
+    // full. Its BYTES are biphase-encoded and bear no fixed ratio to PCM bytes, which is precisely
+    // why this API reports a duration: the frame count is well defined even when the byte count is
+    // not comparable to anything upstream.
+    const uint32_t dma_latency_us = block_duration_us * SPDIF_DMA_BUFFERS_COUNT;
+
     xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::TASK_RUNNING);
 
     // SPDIF continuous mode: loop runs indefinitely, outputting silence when no audio data
     // to keep the receiver synced. Exits only via break (stream info change, silence timeout,
     // lockstep desync, dropped event, or partial-write failure).
     while (true) {
+      // Published from the consumer thread; readers never touch the source (single-consumer-thread).
+      const uint32_t queued_us = this->current_stream_info_.frames_to_microseconds(
+          this->current_stream_info_.bytes_to_frames(audio_source->buffered_bytes()));
+      this->render_latency_us_.store(queued_us + dma_latency_us, std::memory_order_release);
+      // SPDIF pads to a whole block like the standard path, so only the ring's contents are the
+      // caller's own audio. Reporting the DMA span here too would show as a phantom discrepancy
+      // against the caller's pushed-minus-played.
+      this->buffered_audio_us_.store(queued_us, std::memory_order_release);
+
       uint32_t event_group_bits = xEventGroupGetBits(this->event_group_);
 
       if (event_group_bits & SpeakerEventGroupBits::COMMAND_STOP) {
@@ -393,6 +408,9 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
   }
 
   audio_source.reset();
+
+  this->render_latency_us_.store(0, std::memory_order_release);
+  this->buffered_audio_us_.store(0, std::memory_order_release);
 
   xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::TASK_STOPPED);
 

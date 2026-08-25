@@ -81,6 +81,8 @@ struct SourceBinding : public media_source::MediaSourceListener {
   size_t write_audio(const uint8_t *data, size_t length, uint32_t timeout_ms,
                      const audio::AudioStreamInfo &stream_info) override;
   void report_state(media_source::MediaSourceState state) override;
+  bool render_latency(uint32_t &microseconds) const override;
+  bool buffered_audio(uint32_t &microseconds) const override;
   void request_volume(float volume) override;
   void request_mute(bool is_muted) override;
   void request_play_uri(const std::string &uri) override;
@@ -237,6 +239,9 @@ class SpeakerSourceMediaPlayer final : public Component, public media_player::Me
 
   // Pipeline context for media (index 0) and announcement (index 1) pipelines.
   // See THREADING MODEL at top of namespace for access rules.
+  /// Speaker for a pipeline index, or nullptr. Set once at setup, so safe to read from any thread.
+  speaker::Speaker *get_pipeline_speaker_(uint8_t pipeline) const { return this->pipelines_[pipeline].speaker; }
+
   std::array<PipelineContext, 2> pipelines_;
 
   // Used to save volume/mute state for restoration on reboot
