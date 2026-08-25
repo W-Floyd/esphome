@@ -143,18 +143,27 @@ class AudioStreamInfo {
   /// @brief Converts duration to frames.
   /// @param ms Duration in milliseconds
   /// @return Audio frames that will store `ms` milliseconds of audio.  May round down for certain sample rates.
-  uint32_t ms_to_frames(uint32_t ms) const { return (ms * this->sample_rate_) / 1000; }
+  uint32_t ms_to_frames(uint32_t ms) const {
+    return static_cast<uint32_t>((static_cast<uint64_t>(ms) * this->sample_rate_) / 1000);
+  }
 
   /// @brief Converts duration to samples.
   /// @param ms Duration in milliseconds
   /// @return Audio samples that will store `ms` milliseconds of audio.  May round down for certain sample rates.
-  uint32_t ms_to_samples(uint32_t ms) const { return (ms * this->channels_ * this->sample_rate_) / 1000; }
+  uint32_t ms_to_samples(uint32_t ms) const {
+    return static_cast<uint32_t>((static_cast<uint64_t>(ms) * this->channels_ * this->sample_rate_) / 1000);
+  }
 
   /// @brief Converts duration to bytes. May round down for certain sample rates.
   /// @param ms Duration in milliseconds
   /// @return Bytes that will store `ms` milliseconds of audio.  May round down for certain sample rates.
+  // 64-bit intermediate: the 32-bit product wraps past ~24 s for 16-bit stereo at 44.1 kHz. Latent
+  // rather than observed -- callers pass buffer durations -- but the same defect as
+  // frames_to_microseconds(), which was not latent.
   size_t ms_to_bytes(uint32_t ms) const {
-    return (ms * this->bytes_per_sample_ * this->channels_ * this->sample_rate_) / 1000;
+    return static_cast<size_t>((static_cast<uint64_t>(ms) * this->bytes_per_sample_ * this->channels_ *
+                                this->sample_rate_) /
+                               1000);
   }
 
   /// @brief Computes the duration, in microseconds, the given amount of frames represents.

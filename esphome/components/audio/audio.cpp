@@ -23,14 +23,25 @@ AudioStreamInfo::AudioStreamInfo(uint8_t bits_per_sample, uint8_t channels, uint
 }
 
 uint32_t AudioStreamInfo::frames_to_microseconds(uint32_t frames) const {
-  return (frames * 1000000 + (this->sample_rate_ >> 1)) / this->sample_rate_;
+  // 64-bit intermediate: `frames * 1000000` in uint32 arithmetic overflows at 4295 frames, which is
+  // 97.4 ms of audio at 44.1 kHz and 89.5 ms at 48 kHz. The wrapped result is short by exactly
+  // 2^32 / sample_rate per wrap (97391.5 us at 44.1 kHz), silently and with no diagnostic.
+  //
+  // Every current caller passes a sub-buffer frame count and stays well under that, but nothing in
+  // the signature says it must: the parameter is a uint32_t frame count, and a caller reporting a
+  // buffer's occupancy rather than one chunk of it exceeds 4295 frames routinely.
+  return static_cast<uint32_t>((static_cast<uint64_t>(frames) * 1000000 + (this->sample_rate_ >> 1)) /
+                               this->sample_rate_);
 }
 
 uint32_t AudioStreamInfo::frames_to_milliseconds_with_remainder(uint32_t *total_frames) const {
   uint32_t unprocessable_frames = *total_frames % (this->sample_rate_ / this->ms_sample_rate_gcd_);
   uint32_t frames_for_ms_calculation = *total_frames - unprocessable_frames;
 
-  uint32_t playback_ms = (frames_for_ms_calculation * 1000) / this->sample_rate_;
+  // 64-bit for the same reason as frames_to_microseconds(); this one only wraps past ~97 s of audio
+  // in one call, so it is a latent case rather than an observed one, but it is the same defect.
+  uint32_t playback_ms =
+      static_cast<uint32_t>((static_cast<uint64_t>(frames_for_ms_calculation) * 1000) / this->sample_rate_);
   *total_frames = unprocessable_frames;
   return playback_ms;
 }
