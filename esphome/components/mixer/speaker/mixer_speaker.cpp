@@ -650,6 +650,21 @@ void MixerSpeaker::audio_mixer_task(void *params) {
       const uint32_t output_frames_free =
           this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->free());
 
+      // Nothing can be mixed into a full buffer, so iterating again immediately is a spin. The
+      // no-data case below already yields; this is the opposite one -- sources have audio and the
+      // SINK is not draining -- and it had no yield at all. transfer_data_to_sink() only blocks
+      // while the sink is accepting; a stopped sink refuses at once, so the loop ran flat out.
+      //
+      // Measured consequence: a speaker whose sink stopped after a stream teardown starved its own
+      // main loop. The device stayed on wifi and answered pings, but declared healthy API clients
+      // "unresponsive" and disconnected them, and refused OTA -- so it could not be recovered over
+      // the network at all and needed the power pulled. A silent speaker is a bug; an unreachable
+      // one is a much worse bug, and it turned a recoverable routing fault into a site visit.
+      if (output_frames_free == 0) {
+        delay(TASK_DELAY_MS);
+        continue;
+      }
+
       speakers_with_data.clear();
       audio_sources_with_data.clear();
 
