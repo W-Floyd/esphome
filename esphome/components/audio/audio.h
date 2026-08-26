@@ -28,6 +28,42 @@ struct AudioDepth {
   /// it sampled. A stage that sums its own buffers with a downstream reading reports the OLDEST instant
   /// contributing to the total, since that is the one the drain has to be measured from.
   int64_t as_of_us{0};
+
+  /// @brief How much of a render-latency reading does NOT decay as this snapshot ages.
+  ///
+  /// Ageing a stale reading is only valid for the parts that actually drain. An i2s DMA under an
+  /// always-fill writer does not: every task iteration writes a whole buffer, padding with silence as
+  /// needed, so its span stays full and costs the same time to clock out however old the reading is.
+  /// A consumer that aged the whole latency drove hard resyncs at 350 ms, 2297 ms and 3581 ms within
+  /// four seconds; one that aged the wrong term instead -- taking real-audio-in-DMA for the span --
+  /// under-anchored by the padding and left a pair 67 ms apart. Hence a term for it, published rather
+  /// than guessed.
+  ///
+  /// A consumer ageing a reading of age A wants:  held + max(0, (microseconds - held) - A).
+  ///
+  /// Qualifies the RENDER reading (read_render), which is the padding-inclusive one; the own-audio
+  /// reading counts no padding and every part of it drains. A composing stage reports its downstream's
+  /// value plus any of its own buffers that refill themselves -- normally none, an ordinary queue
+  /// drains.
+  ///
+  /// 0 means "nothing held", which is also what a stage unable to distinguish reports. That is the
+  /// safe direction only for the consumer that treats it as "do not age": ageing everything is the
+  /// failure above. Callers must decide explicitly which they mean.
+  uint32_t render_nondraining_us{0};
+
+  // TEMPORARY DIAGNOSTIC: the total broken into the stage that holds each part, carried under the same
+  // seqlock so a consumer reads every term at ONE instant. Attributing a total to a stage by logging
+  // the stages separately does not work when the quantity sought is 20 ms and the samples are hundreds
+  // of milliseconds apart. Remove once the offset is explained.
+  uint32_t dbg_own_us{0};     // the source ring feeding a mixer
+  uint32_t dbg_xfer_us{0};    // a mixer's output transfer buffer
+  uint32_t dbg_queued_us{0};  // the sink's own ring
+  uint32_t dbg_dma_us{0};     // real audio resident in the sink's DMA descriptors
+  // Cumulative FRAME counts at each boundary, for a conservation check. Every boundary must satisfy
+  // received == passed-on + still-held; the boundary where that fails is the one losing audio.
+  uint32_t dbg_src_received{0};   // frames accepted into the source ring
+  uint32_t dbg_src_consumed{0};   // frames the mixer took out of it
+  uint32_t dbg_sink_received{0};  // frames accepted into the sink's own ring
 };
 
 /// @brief Single-writer, multi-reader store for the two depth readings a speaker publishes.
@@ -43,11 +79,22 @@ struct AudioDepth {
 class DepthPublisher {
  public:
   /// Publishes both readings and the instant they describe. Call from the owning task only.
-  void publish(uint32_t render_us, uint32_t audio_us, int64_t as_of_us) {
+  void publish(uint32_t render_us, uint32_t audio_us, int64_t as_of_us, uint32_t dbg_own_us = 0,
+               uint32_t dbg_xfer_us = 0, uint32_t dbg_queued_us = 0, uint32_t dbg_dma_us = 0,
+               uint32_t dbg_src_received = 0, uint32_t dbg_src_consumed = 0, uint32_t dbg_sink_received = 0,
+               uint32_t render_nondraining_us = 0) {
     const uint32_t seq = this->seq_.load(std::memory_order_relaxed);
     this->seq_.store(seq + 1, std::memory_order_release);  // odd: publish in progress
     this->render_us_.store(render_us, std::memory_order_relaxed);
     this->audio_us_.store(audio_us, std::memory_order_relaxed);
+    this->dbg_own_us_.store(dbg_own_us, std::memory_order_relaxed);
+    this->dbg_xfer_us_.store(dbg_xfer_us, std::memory_order_relaxed);
+    this->dbg_queued_us_.store(dbg_queued_us, std::memory_order_relaxed);
+    this->dbg_dma_us_.store(dbg_dma_us, std::memory_order_relaxed);
+    this->dbg_src_received_.store(dbg_src_received, std::memory_order_relaxed);
+    this->dbg_src_consumed_.store(dbg_src_consumed, std::memory_order_relaxed);
+    this->dbg_sink_received_.store(dbg_sink_received, std::memory_order_relaxed);
+    this->render_nondraining_us_.store(render_nondraining_us, std::memory_order_relaxed);
     this->as_of_lo_.store(static_cast<uint32_t>(static_cast<uint64_t>(as_of_us)), std::memory_order_relaxed);
     this->as_of_hi_.store(static_cast<uint32_t>(static_cast<uint64_t>(as_of_us) >> 32), std::memory_order_relaxed);
     this->seq_.store(seq + 2, std::memory_order_release);  // even: stable
@@ -60,6 +107,12 @@ class DepthPublisher {
   bool read_render(AudioDepth &depth) const { return this->read_(depth, this->render_us_); }
   bool read_audio(AudioDepth &depth) const { return this->read_(depth, this->audio_us_); }
 
+  /// @brief Whether anything has ever been published. A speaker that has not started yet holds a
+  /// zero-initialised snapshot, and reporting that as a real reading hands the caller an as_of of 0
+  /// -- which a composing stage will happily adopt as "the oldest instant in the total", producing a
+  /// timestamp stale by the entire uptime. Observed as an age of 10 s on a freshly started mixer.
+  bool has_published() const { return this->seq_.load(std::memory_order_acquire) != 0; }
+
  private:
   bool read_(AudioDepth &depth, const std::atomic<uint32_t> &field) const {
     // Bounded retry. A publisher runs on a task cadence measured in tens of milliseconds, so a reader
@@ -68,11 +121,7 @@ class DepthPublisher {
     for (int attempt = 0; attempt < 4; attempt++) {
       const uint32_t before = this->seq_.load(std::memory_order_acquire);
       if (before == 0) {
-        // Never published. A speaker that has not started holds a zero-initialised snapshot, and
-        // returning that as a real reading hands the caller an as_of of 0 -- which a composing stage
-        // adopts as "the oldest instant in the total", stamping the composite with the epoch.
-        // Measured on a freshly started mixer as a reported age of 10 s.
-        return false;
+        return false;  // never published: a zero snapshot is not a reading
       }
       if (before & 1u) {
         continue;  // publish in progress
@@ -80,9 +129,25 @@ class DepthPublisher {
       const uint32_t us = field.load(std::memory_order_relaxed);
       const uint64_t lo = this->as_of_lo_.load(std::memory_order_relaxed);
       const uint64_t hi = this->as_of_hi_.load(std::memory_order_relaxed);
+      const uint32_t d_own = this->dbg_own_us_.load(std::memory_order_relaxed);
+      const uint32_t d_xfer = this->dbg_xfer_us_.load(std::memory_order_relaxed);
+      const uint32_t d_queued = this->dbg_queued_us_.load(std::memory_order_relaxed);
+      const uint32_t d_dma = this->dbg_dma_us_.load(std::memory_order_relaxed);
+      const uint32_t d_sr = this->dbg_src_received_.load(std::memory_order_relaxed);
+      const uint32_t d_sc = this->dbg_src_consumed_.load(std::memory_order_relaxed);
+      const uint32_t d_kr = this->dbg_sink_received_.load(std::memory_order_relaxed);
+      const uint32_t nd = this->render_nondraining_us_.load(std::memory_order_relaxed);
       if (this->seq_.load(std::memory_order_acquire) == before) {
         depth.microseconds = us;
         depth.as_of_us = static_cast<int64_t>((hi << 32) | lo);
+        depth.dbg_own_us = d_own;
+        depth.dbg_xfer_us = d_xfer;
+        depth.dbg_queued_us = d_queued;
+        depth.dbg_dma_us = d_dma;
+        depth.dbg_src_received = d_sr;
+        depth.dbg_src_consumed = d_sc;
+        depth.dbg_sink_received = d_kr;
+        depth.render_nondraining_us = nd;
         return true;
       }
     }
@@ -96,6 +161,15 @@ class DepthPublisher {
   std::atomic<uint32_t> audio_us_{0};
   std::atomic<uint32_t> as_of_lo_{0};
   std::atomic<uint32_t> as_of_hi_{0};
+  // TEMPORARY DIAGNOSTIC, see AudioDepth.
+  std::atomic<uint32_t> dbg_own_us_{0};
+  std::atomic<uint32_t> dbg_xfer_us_{0};
+  std::atomic<uint32_t> dbg_queued_us_{0};
+  std::atomic<uint32_t> dbg_dma_us_{0};
+  std::atomic<uint32_t> render_nondraining_us_{0};
+  std::atomic<uint32_t> dbg_src_received_{0};
+  std::atomic<uint32_t> dbg_src_consumed_{0};
+  std::atomic<uint32_t> dbg_sink_received_{0};
 };
 
 class AudioStreamInfo {

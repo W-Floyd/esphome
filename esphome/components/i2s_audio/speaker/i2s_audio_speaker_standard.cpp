@@ -13,6 +13,8 @@
 
 #include "esp_timer.h"
 
+#include <cinttypes>
+
 // esp-audio-libs
 #include <pcm_convert.h>
 
@@ -114,6 +116,12 @@ void I2SAudioSpeaker::run_speaker_task() {
   }
   // dma_buffer_bytes counts output-format bytes; convert with the output stream info.
   const uint32_t frames_per_dma_buffer = this->output_stream_info_.bytes_to_frames(dma_buffer_bytes);
+  // TEMPORARY DIAGNOSTIC: the size ESP-IDF actually allocated, which the requested value only
+  // approximates. 20000 us of unexplained depth offset is exactly 882 frames at 44.1 kHz, so whether
+  // one buffer is 441 frames or something else decides whether that offset is a whole number of them.
+  ESP_LOGD(TAG, "I2SDBG geometry: frames_per_dma_buffer=%" PRIu32 " dma_buffer_bytes=%u total_dma_bytes=%u count=%u",
+           frames_per_dma_buffer, (unsigned) dma_buffer_bytes, (unsigned) total_dma_bytes,
+           (unsigned) DMA_BUFFERS_COUNT);
   // Soft cap for each source read: enough input-format bytes to fill one DMA buffer's worth of frames.
   const size_t dma_buffer_input_bytes = this->current_stream_info_.frames_to_bytes(frames_per_dma_buffer);
 
@@ -186,6 +194,12 @@ void I2SAudioSpeaker::run_speaker_task() {
     // those descriptors, which render_latency() counts and buffered_audio() must not.
     uint32_t dma_real_frames = 0;
     uint32_t last_data_received_time = millis();
+    // TEMPORARY DIAGNOSTIC: cumulative real frames written into descriptors and confirmed played.
+    // dma_real_frames is maintained as their difference, so logging all three shows whether it is
+    // self-consistent, and `completed` is directly comparable to the consumer's own played count.
+    uint64_t dbg_written_real = 0;
+    uint64_t dbg_completed_real = 0;
+    int64_t dbg_last_log_us = 0;
 
     // Descriptors are preloaded and the channel is enabled, so the span really is resident now.
     this->dma_resident_bytes_.store(total_dma_bytes, std::memory_order_relaxed);
@@ -241,6 +255,7 @@ void I2SAudioSpeaker::run_speaker_task() {
           break;
         }
         dma_real_frames -= std::min(dma_real_frames, real_frames);
+        dbg_completed_real += real_frames;
         if (real_frames > 0) {
           pending_real_buffers--;
           // Real audio is packed at the start of each DMA buffer with any silence padding on the
@@ -279,10 +294,32 @@ void I2SAudioSpeaker::run_speaker_task() {
       // Stamped with the instant both terms were sampled -- now, a few microseconds after the ring
       // read above and before this iteration writes anything. A reader is up to one DMA buffer late
       // by the time it looks, and the only way it can correct for that is to be told when this was.
+      // TEMPORARY DIAGNOSTIC, time-throttled (this loop paces on i2s_channel_write, so an
+      // every-N-iterations throttle is not a rate bound). Remove once the offset is explained.
+      const int64_t dbg_now = esp_timer_get_time();
+      if (dbg_now - dbg_last_log_us >= 1000000) {
+        dbg_last_log_us = dbg_now;
+        ESP_LOGD(TAG,
+                 "I2SDBG queued=%" PRIu32 " dma_real=%" PRIu32 " (%" PRIu32 " us) written=%llu completed=%llu "
+                 "inflight=%llu",
+                 queued_us, dma_real_frames, this->current_stream_info_.frames_to_microseconds(dma_real_frames),
+                 (unsigned long long) dbg_written_real, (unsigned long long) dbg_completed_real,
+                 (unsigned long long) (dbg_written_real - dbg_completed_real));
+      }
+      // The DMA span is the non-draining part of the render latency: this writer always composes a
+      // WHOLE buffer, padding with silence when the source is short, so the span stays full and costs
+      // the same time to clock out no matter how stale a reading of it gets. Everything upstream of it
+      // -- the ring counted by queued_us -- drains normally. Reported so a consumer ageing a stale
+      // snapshot can age only the queue; see AudioDepth::render_nondraining_us for what goes wrong
+      // when that split is guessed instead.
+      const uint32_t dma_span_us =
+          this->output_stream_info_.frames_to_microseconds(this->output_stream_info_.bytes_to_frames(
+              this->dma_resident_bytes_.load(std::memory_order_relaxed)));
       this->depth_.publish(
-          queued_us + this->output_stream_info_.frames_to_microseconds(this->output_stream_info_.bytes_to_frames(
-                          this->dma_resident_bytes_.load(std::memory_order_relaxed))),
-          queued_us + this->current_stream_info_.frames_to_microseconds(dma_real_frames), esp_timer_get_time());
+          queued_us + dma_span_us,
+          queued_us + this->current_stream_info_.frames_to_microseconds(dma_real_frames), esp_timer_get_time(), 0, 0,
+          queued_us, this->current_stream_info_.frames_to_microseconds(dma_real_frames), 0, 0,
+          this->dbg_received_frames_.load(std::memory_order_relaxed), dma_span_us);
 
       // Compose exactly one DMA buffer's worth: drain as much real audio as the source currently
       // exposes (may take multiple fill() calls when crossing a ring buffer wrap), then pad any
@@ -366,6 +403,7 @@ void I2SAudioSpeaker::run_speaker_task() {
       // succeeds even with a transient backlog of unprocessed events; if it ever fails the lockstep
       // invariant is broken and every subsequent timestamp would be silently wrong, so bail.
       dma_real_frames += real_frames_total;
+      dbg_written_real += real_frames_total;
       if (xQueueSend(this->write_records_queue_, &real_frames_total, 0) != pdTRUE) {
         ESP_LOGV(TAG, "Exiting: write records queue full");
         xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::ERR_LOCKSTEP_DESYNC);

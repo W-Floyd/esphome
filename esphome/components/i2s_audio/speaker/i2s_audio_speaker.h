@@ -170,6 +170,9 @@ class I2SAudioSpeakerBase : public I2SAudioOut, public speaker::Speaker, public 
   // REPORTED, via as_of_us, rather than left for a caller to guess at. Zeroed whenever the task is
   // not running, so a stopped speaker reports a true zero rather than a stale span.
   audio::DepthPublisher depth_;
+  // TEMPORARY DIAGNOSTIC: cumulative frames accepted into this speaker's ring, for the conservation
+  // check received == written-to-DMA + still-queued.
+  std::atomic<uint32_t> dbg_received_frames_{0};
   // Output-format bytes resident in the DMA descriptors, for the task's own use when it recomputes
   // the latency reading. 0 until the descriptors are preloaded.
   std::atomic<size_t> dma_resident_bytes_{0};

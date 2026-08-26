@@ -9,6 +9,8 @@
 
 #include "esp_timer.h"
 
+#include <cinttypes>
+
 #include <mixer.h>        // esp-audio-libs
 #include <pcm_convert.h>  // esp-audio-libs
 
@@ -223,6 +225,9 @@ size_t SourceSpeaker::play(const uint8_t *data, size_t length, TickType_t ticks_
   if (temp_ring_buffer.use_count() > 0) {
     // Only write to the ring buffer if the reference is valid
     bytes_written = temp_ring_buffer->write_without_replacement(data, length, ticks_to_wait);
+    // TEMPORARY DIAGNOSTIC: what the ring actually took.
+    this->dbg_received_frames_.fetch_add(this->audio_stream_info_.bytes_to_frames(bytes_written),
+                                         std::memory_order_relaxed);
     if (bytes_written > 0) {
       this->last_seen_data_ms_ = millis();
     }
@@ -342,7 +347,35 @@ size_t SourceSpeaker::process_data_from_source(std::shared_ptr<audio::RingBuffer
   // instant describes.
   this->depth_.publish(own_us + this->parent_->get_downstream_latency_us(),
                        own_us + this->parent_->get_downstream_audio_us(),
-                       this->parent_->get_downstream_as_of_us());
+                       this->parent_->get_downstream_as_of_us(), own_us, this->parent_->get_dbg_xfer_us(),
+                       this->parent_->get_dbg_sink_queued_us(), this->parent_->get_dbg_sink_dma_us(),
+                       this->dbg_received_frames_.load(std::memory_order_relaxed),
+                       this->dbg_consumed_frames_.load(std::memory_order_relaxed),
+                       this->parent_->get_dbg_sink_received(), this->parent_->get_downstream_nondraining_us());
+
+  // TEMPORARY DIAGNOSTIC: see the matching line in the mixer task. Remove once explained.
+  //
+  // `pending` is the referee. pending_playback_frames_ is the mixer's OWN count of frames it has
+  // consumed from this source's ring but not yet reported as played, maintained independently of
+  // every duration in this chain: incremented where the mix happens, decremented by the output
+  // speaker's callback. It is therefore what `xfer + sink` OUGHT to equal, in frames.
+  //
+  // If pending exceeds the reported xfer + sink, the reported depths are missing audio the mixer
+  // knows it is holding, and the fault is on the measurement side. If they agree, the consumer's
+  // own pushed-minus-played is the side that is high. One line settles it either way.
+  const int64_t depth_debug_now = esp_timer_get_time();
+  if (depth_debug_now - this->depth_debug_last_us_ >= 1000000) {
+    this->depth_debug_last_us_ = depth_debug_now;
+    const uint32_t pending_us =
+        this->audio_stream_info_.frames_to_microseconds(this->pending_playback_frames_.load(std::memory_order_acquire));
+    const uint32_t delay_us =
+        this->audio_stream_info_.frames_to_microseconds(this->playback_delay_frames_.load(std::memory_order_acquire));
+    ESP_LOGD(TAG,
+             "DEPTH own=%" PRIu32 " down_audio=%" PRIu32 " total_audio=%" PRIu32 " pending=%" PRIu32 " delay=%" PRIu32
+             " age=%" PRId64,
+             own_us, this->parent_->get_downstream_audio_us(), own_us + this->parent_->get_downstream_audio_us(),
+             pending_us, delay_us, esp_timer_get_time() - this->parent_->get_downstream_as_of_us());
+  }
 
   if (audio_source->available() > 0) {
     // Existing exposure was ducked when fill() promoted it; do not re-duck on partial-consume re-entry.
@@ -548,7 +581,7 @@ void MixerSpeaker::audio_mixer_task(void *params) {
       // Reading both before the transfer makes them coherent: nothing moves between stages in the
       // window between the sink's publish and this read, because the mixer is the only thing that
       // feeds the sink and its previous transfer predates that publish.
-      uint32_t sink_us = 0, sink_audio_us = 0;
+      uint32_t sink_us = 0, sink_audio_us = 0, sink_nondraining_us = 0;
       int64_t downstream_as_of_us = esp_timer_get_time();
       if (this_mixer->output_speaker_ != nullptr) {
         audio::AudioDepth sink_latency, sink_audio;
@@ -556,6 +589,11 @@ void MixerSpeaker::audio_mixer_task(void *params) {
         // and taking the min against a zero would stamp the composite with the epoch.
         if (this_mixer->output_speaker_->render_latency(sink_latency)) {
           sink_us = sink_latency.microseconds;
+          // Carried through unchanged: this mixer's own transfer buffer drains normally, so it adds
+          // nothing to the held term, and without propagating the sink's value every chain with a
+          // mixer in it would report zero held and a consumer would age the DMA span along with the
+          // rest. Zero must mean "nothing is held", not "nobody asked the sink".
+          sink_nondraining_us = sink_latency.render_nondraining_us;
           if (sink_latency.as_of_us > 0) {
             downstream_as_of_us = std::min(downstream_as_of_us, sink_latency.as_of_us);
           }
@@ -565,9 +603,14 @@ void MixerSpeaker::audio_mixer_task(void *params) {
           if (sink_audio.as_of_us > 0) {
             downstream_as_of_us = std::min(downstream_as_of_us, sink_audio.as_of_us);
           }
+          this_mixer->dbg_sink_queued_us_ = sink_audio.dbg_queued_us;
+          this_mixer->dbg_sink_dma_us_ = sink_audio.dbg_dma_us;
+          this_mixer->dbg_sink_received_ = sink_audio.dbg_sink_received;
         }
       }
       this_mixer->downstream_as_of_us_ = downstream_as_of_us;
+      this_mixer->dbg_xfer_us_ = this_mixer->audio_stream_info_.value().frames_to_microseconds(
+          this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->available()));
       // The transfer buffer holds only real mixed audio, so it counts toward both.
       this_mixer->downstream_audio_us_.store(
           this_mixer->audio_stream_info_.value().frames_to_microseconds(
@@ -579,6 +622,23 @@ void MixerSpeaker::audio_mixer_task(void *params) {
               this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->available())) +
               sink_us,
           std::memory_order_release);
+      this_mixer->downstream_nondraining_us_.store(sink_nondraining_us, std::memory_order_release);
+
+      // TEMPORARY DIAGNOSTIC: attribute the composite to its terms. A consumer sees only the sum, so a
+      // constant offset in it cannot be pinned to a stage from the outside.
+      //
+      // Throttled BY TIME, not by iteration count. This loop has no fixed cadence: when the sink stops
+      // accepting audio and the transfer buffer is already full there is nothing to wait on, so it
+      // spins at hundreds of iterations per second. A per-N-iterations throttle then emits dozens of
+      // lines per millisecond, which floods the log and can stall an OTA. Remove once explained.
+      const int64_t depth_debug_now = esp_timer_get_time();
+      if (depth_debug_now - this_mixer->depth_debug_last_us_ >= 1000000) {
+        this_mixer->depth_debug_last_us_ = depth_debug_now;
+        const uint32_t xfer_us = this_mixer->audio_stream_info_.value().frames_to_microseconds(
+            this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->available()));
+        ESP_LOGD(TAG, "DEPTH xfer=%" PRIu32 " sink_audio=%" PRIu32 " sink_lat=%" PRIu32 " age=%" PRId64,
+                 xfer_us, sink_audio_us, sink_us, esp_timer_get_time() - downstream_as_of_us);
+      }
 
       // Hand audio to the sink only AFTER publishing the pair above, so the two terms describe the
       // same instant. Never shift the data in the output transfer buffer to avoid unnecessary, slow
@@ -642,13 +702,26 @@ void MixerSpeaker::audio_mixer_task(void *params) {
 
           // Set playback delay for newly contributing source
           if (!speakers_with_data[0]->has_contributed_.load(std::memory_order_acquire)) {
-            speakers_with_data[0]->playback_delay_frames_.store(
-                this_mixer->frames_in_pipeline_.load(std::memory_order_acquire), std::memory_order_release);
+            const uint32_t dbg_delay = this_mixer->frames_in_pipeline_.load(std::memory_order_acquire);
+            // TEMPORARY DIAGNOSTIC: fires exactly once per contribution start, so it needs no
+            // throttle. This is the instant a consumer's accounting can acquire a permanent offset:
+            // the first `dbg_delay` frames the SINK plays are charged to the delay and never credited
+            // to this source. Field evidence says a start leaves 2-4 DMA buffers uncredited and that
+            // the amount VARIES per start, which is the shape of this number rather than of any
+            // constant in the code. Logged with what the source already holds so the two can be
+            // compared against the drift the consumer reports immediately afterwards.
+            ESP_LOGD(TAG,
+                     "STARTDBG single: playback_delay=%" PRIu32 " frames (%" PRIu32 " us) pending=%" PRIu32
+                     " frames_to_mix=%" PRIu32,
+                     dbg_delay, speakers_with_data[0]->get_audio_stream_info().frames_to_microseconds(dbg_delay),
+                     speakers_with_data[0]->pending_playback_frames_.load(std::memory_order_acquire), frames_to_mix);
+            speakers_with_data[0]->playback_delay_frames_.store(dbg_delay, std::memory_order_release);
             speakers_with_data[0]->has_contributed_.store(true, std::memory_order_release);
           }
 
           // Update source speaker pending frames
           speakers_with_data[0]->pending_playback_frames_.fetch_add(frames_to_mix, std::memory_order_release);
+          speakers_with_data[0]->dbg_consumed_frames_.fetch_add(frames_to_mix, std::memory_order_relaxed);
           audio_sources_with_data[0]->consume(active_stream_info.frames_to_bytes(frames_to_mix));
 
           // Update output transfer buffer length and pipeline frame count
@@ -706,11 +779,19 @@ void MixerSpeaker::audio_mixer_task(void *params) {
         for (size_t i = 0; i < audio_sources_with_data.size(); ++i) {
           // Set playback delay for newly contributing sources
           if (!speakers_with_data[i]->has_contributed_.load(std::memory_order_acquire)) {
+            // TEMPORARY DIAGNOSTIC: as above, on the multi-source path.
+            ESP_LOGD(TAG,
+                     "STARTDBG mixed[%u]: playback_delay=%" PRIu32 " frames (%" PRIu32 " us) pending=%" PRIu32
+                     " frames_to_mix=%" PRIu32,
+                     (unsigned) i, current_pipeline_frames,
+                     speakers_with_data[i]->get_audio_stream_info().frames_to_microseconds(current_pipeline_frames),
+                     speakers_with_data[i]->pending_playback_frames_.load(std::memory_order_acquire), frames_to_mix);
             speakers_with_data[i]->playback_delay_frames_.store(current_pipeline_frames, std::memory_order_release);
             speakers_with_data[i]->has_contributed_.store(true, std::memory_order_release);
           }
 
           speakers_with_data[i]->pending_playback_frames_.fetch_add(frames_to_mix, std::memory_order_release);
+          speakers_with_data[i]->dbg_consumed_frames_.fetch_add(frames_to_mix, std::memory_order_relaxed);
           audio_sources_with_data[i]->consume(
               speakers_with_data[i]->get_audio_stream_info().frames_to_bytes(frames_to_mix));
         }

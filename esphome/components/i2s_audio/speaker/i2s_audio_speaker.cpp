@@ -204,6 +204,10 @@ size_t I2SAudioSpeakerBase::play(const uint8_t *data, size_t length, TickType_t 
     if (temp_ring_buffer != nullptr) {
       // The weak_ptr locks successfully only while the speaker task owns the ring buffer, so it is safe to write
       bytes_written = temp_ring_buffer->write_without_replacement((void *) data, length, ticks_to_wait);
+      // TEMPORARY DIAGNOSTIC: cumulative frames this speaker accepted. Counted from what the ring
+      // actually took, not from what was offered, so a short write cannot inflate it.
+      this->dbg_received_frames_.fetch_add(this->audio_stream_info_.bytes_to_frames(bytes_written),
+                                           std::memory_order_relaxed);
     }
   }
 

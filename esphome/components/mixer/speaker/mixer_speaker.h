@@ -111,6 +111,11 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
   // audio chunks, because the chunks it had pushed since the snapshot were in its accumulator and not
   // in here. The instant is what lets it line the two up.
   audio::DepthPublisher depth_;
+  int64_t depth_debug_last_us_{0};  // TEMPORARY: time-throttles the DEPTH diagnostic
+  // TEMPORARY DIAGNOSTIC: cumulative frames into and out of this source's ring, for the conservation
+  // check received == consumed + still-held.
+  std::atomic<uint32_t> dbg_received_frames_{0};
+  std::atomic<uint32_t> dbg_consumed_frames_{0};
   std::shared_ptr<audio::RingBufferAudioSource> audio_source_;
   std::weak_ptr<ring_buffer::RingBuffer> ring_buffer_;
 
@@ -137,11 +142,21 @@ class MixerSpeaker final : public Component {
   /// plus the output speaker -- in microseconds. Published by the mixer task once per iteration.
   uint32_t get_downstream_latency_us() const { return this->downstream_latency_us_.load(std::memory_order_acquire); }
   uint32_t get_downstream_audio_us() const { return this->downstream_audio_us_.load(std::memory_order_acquire); }
+  /// @brief The part of the downstream LATENCY that does not decay with age -- the sink's DMA span.
+  /// See AudioDepth::render_nondraining_us. Passed straight through: this mixer's transfer buffer
+  /// drains like any queue, so it contributes nothing of its own.
+  uint32_t get_downstream_nondraining_us() const {
+    return this->downstream_nondraining_us_.load(std::memory_order_acquire);
+  }
   /// @brief The OLDEST instant contributing to the downstream terms above -- the sink's own snapshot
   /// instant, which is older than the transfer buffer read that accompanies it. A total is only as
   /// current as its stalest term, and the drain has to be measured from that one.
   /// @note Mixer task only, like the setter. Never crosses a task boundary, so it needs no atomic.
   int64_t get_downstream_as_of_us() const { return this->downstream_as_of_us_; }
+  uint32_t get_dbg_xfer_us() const { return this->dbg_xfer_us_; }
+  uint32_t get_dbg_sink_queued_us() const { return this->dbg_sink_queued_us_; }
+  uint32_t get_dbg_sink_dma_us() const { return this->dbg_sink_dma_us_; }
+  uint32_t get_dbg_sink_received() const { return this->dbg_sink_received_; }
 
   void dump_config() override;
   void setup() override;
@@ -188,11 +203,19 @@ class MixerSpeaker final : public Component {
   // speaker -- as a duration, published by the mixer task. Held here rather than computed on demand
   // because the transfer buffer is task-local and unreachable from any other thread.
   std::atomic<uint32_t> downstream_latency_us_{0};
+  std::atomic<uint32_t> downstream_nondraining_us_{0};
   std::atomic<uint32_t> downstream_audio_us_{0};
   // Written by the mixer task alongside the two terms above and read back by the mixer task one call
   // later, in process_data_from_source(). It never crosses a task boundary, so it is a plain member --
   // a 64-bit atomic is not lock-free on these targets and there is nothing here to make lock-free.
   int64_t downstream_as_of_us_{0};
+  // TEMPORARY DIAGNOSTIC: the sink's own split and this mixer's transfer buffer, captured with the
+  // reading above so a consumer sees every term at one instant. Mixer task only, like the rest.
+  uint32_t dbg_xfer_us_{0};
+  uint32_t dbg_sink_queued_us_{0};
+  uint32_t dbg_sink_dma_us_{0};
+  uint32_t dbg_sink_received_{0};
+  int64_t depth_debug_last_us_{0};  // TEMPORARY: time-throttles the DEPTH diagnostic
   optional<audio::AudioStreamInfo> audio_stream_info_;
 
   std::atomic<uint32_t> frames_in_pipeline_{0};  // Frames written to output but not yet played
