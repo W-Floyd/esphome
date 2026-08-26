@@ -352,7 +352,7 @@ size_t SourceSpeaker::process_data_from_source(std::shared_ptr<audio::RingBuffer
                        this->dbg_received_frames_.load(std::memory_order_relaxed),
                        this->dbg_consumed_frames_.load(std::memory_order_relaxed),
                        this->parent_->get_dbg_sink_received(), this->parent_->get_downstream_nondraining_us(),
-                       this->parent_->get_dbg_sink_inflight_us());
+                       this->parent_->get_dbg_sink_inflight_us(), this->parent_->get_dbg_sink_padded_frames());
 
   // TEMPORARY DIAGNOSTIC: see the matching line in the mixer task. Remove once explained.
   //
@@ -609,6 +609,7 @@ void MixerSpeaker::audio_mixer_task(void *params) {
           this_mixer->dbg_sink_queued_us_ = sink_audio.dbg_queued_us;
           this_mixer->dbg_sink_dma_us_ = sink_audio.dbg_dma_us;
           this_mixer->dbg_sink_received_ = sink_audio.dbg_sink_received;
+          this_mixer->dbg_sink_padded_frames_ = sink_audio.dbg_padded_frames;
           have_sink_received = true;
           sink_received_frames = sink_audio.dbg_sink_received;
         }
@@ -761,12 +762,18 @@ void MixerSpeaker::audio_mixer_task(void *params) {
           if (!speakers_with_data[0]->has_contributed_.load(std::memory_order_acquire)) {
             const uint32_t dbg_delay = this_mixer->frames_in_pipeline_.load(std::memory_order_acquire);
             // TEMPORARY DIAGNOSTIC: fires exactly once per contribution start, so it needs no
-            // throttle. This is the instant a consumer's accounting can acquire a permanent offset:
-            // the first `dbg_delay` frames the SINK plays are charged to the delay and never credited
-            // to this source. Field evidence says a start leaves 2-4 DMA buffers uncredited and that
-            // the amount VARIES per start, which is the shape of this number rather than of any
-            // constant in the code. Logged with what the source already holds so the two can be
-            // compared against the drift the consumer reports immediately afterwards.
+            // throttle. The theory it was added to test is DISPROVEN, and the number is kept only
+            // because it is free: this was believed to be where a consumer acquires a permanent
+            // offset, on the argument that the first `dbg_delay` frames the sink plays are charged to
+            // the delay and never credited to this source, and that a start leaves 2-4 DMA buffers
+            // uncredited by a varying amount.
+            //
+            // Measured across 18 starts on two boards: playback_delay was ZERO every single time.
+            // Whatever plants a per-start offset in a consumer, it is not this. The per-start offsets
+            // that prompted the theory (30-130 us on a logic analyser) survive with this at zero, and
+            // padded silence was eliminated as the mechanism separately -- two devices differing by
+            // 877 ms of accumulated padding sat 133 us apart, so the sink's per-descriptor real-frame
+            // bookkeeping is handling that correctly.
             ESP_LOGD(TAG,
                      "STARTDBG single: playback_delay=%" PRIu32 " frames (%" PRIu32 " us) pending=%" PRIu32
                      " frames_to_mix=%" PRIu32,

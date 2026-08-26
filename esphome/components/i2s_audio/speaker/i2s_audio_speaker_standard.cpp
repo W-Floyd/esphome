@@ -319,7 +319,8 @@ void I2SAudioSpeaker::run_speaker_task() {
           queued_us + dma_span_us,
           queued_us + this->current_stream_info_.frames_to_microseconds(dma_real_frames), esp_timer_get_time(), 0, 0,
           queued_us, this->current_stream_info_.frames_to_microseconds(dma_real_frames), 0, 0,
-          this->dbg_received_frames_.load(std::memory_order_relaxed), dma_span_us);
+          this->dbg_received_frames_.load(std::memory_order_relaxed), dma_span_us, 0,
+          this->dbg_padded_frames_.load(std::memory_order_relaxed));
 
       // Compose exactly one DMA buffer's worth: drain as much real audio as the source currently
       // exposes (may take multiple fill() calls when crossing a ring buffer wrap), then pad any
@@ -389,6 +390,10 @@ void I2SAudioSpeaker::run_speaker_task() {
 
       const size_t silence_bytes = dma_buffer_bytes - bytes_written_total;
       if (silence_bytes > 0) {
+        // Counted before the write, because what matters downstream is that this much silence is
+        // about to sit in front of every frame that follows it.
+        this->dbg_padded_frames_.fetch_add(this->output_stream_info_.bytes_to_frames(silence_bytes),
+                                           std::memory_order_relaxed);
         size_t bw = 0;
         i2s_channel_write(this->tx_handle_, silence_buffer, silence_bytes, &bw, WRITE_TIMEOUT_TICKS);
         if (bw != silence_bytes) {

@@ -173,6 +173,11 @@ class I2SAudioSpeakerBase : public I2SAudioOut, public speaker::Speaker, public 
   // TEMPORARY DIAGNOSTIC: cumulative frames accepted into this speaker's ring, for the conservation
   // check received == written-to-DMA + still-queued.
   std::atomic<uint32_t> dbg_received_frames_{0};
+  /// @brief Cumulative silence frames this speaker has padded into DMA descriptors behind real
+  /// audio. Padding occupies playout time but is not our audio, so every frame of it displaces
+  /// everything after it later -- permanently, and invisibly to any accounting that counts only
+  /// real frames. Published so a consumer can see the displacement it cannot otherwise measure.
+  std::atomic<uint32_t> dbg_padded_frames_{0};
   // Output-format bytes resident in the DMA descriptors, for the task's own use when it recomputes
   // the latency reading. 0 until the descriptors are preloaded.
   std::atomic<size_t> dma_resident_bytes_{0};
