@@ -58,6 +58,10 @@ struct AudioDepth {
   uint32_t dbg_own_us{0};     // the source ring feeding a mixer
   uint32_t dbg_xfer_us{0};    // a mixer's output transfer buffer
   uint32_t dbg_queued_us{0};  // the sink's own ring
+  // Handed to the sink but not yet in the snapshot the sink published: the two stages keep cumulative
+  // frame counts, so this is their difference rather than a duration anyone measured. Without it the
+  // composite omits whatever moved between the sink's publish and the mixer's read of its own buffer.
+  uint32_t dbg_inflight_us{0};
   uint32_t dbg_dma_us{0};     // real audio resident in the sink's DMA descriptors
   // Cumulative FRAME counts at each boundary, for a conservation check. Every boundary must satisfy
   // received == passed-on + still-held; the boundary where that fails is the one losing audio.
@@ -82,7 +86,7 @@ class DepthPublisher {
   void publish(uint32_t render_us, uint32_t audio_us, int64_t as_of_us, uint32_t dbg_own_us = 0,
                uint32_t dbg_xfer_us = 0, uint32_t dbg_queued_us = 0, uint32_t dbg_dma_us = 0,
                uint32_t dbg_src_received = 0, uint32_t dbg_src_consumed = 0, uint32_t dbg_sink_received = 0,
-               uint32_t render_nondraining_us = 0) {
+               uint32_t render_nondraining_us = 0, uint32_t dbg_inflight_us = 0) {
     const uint32_t seq = this->seq_.load(std::memory_order_relaxed);
     this->seq_.store(seq + 1, std::memory_order_release);  // odd: publish in progress
     this->render_us_.store(render_us, std::memory_order_relaxed);
@@ -95,6 +99,7 @@ class DepthPublisher {
     this->dbg_src_consumed_.store(dbg_src_consumed, std::memory_order_relaxed);
     this->dbg_sink_received_.store(dbg_sink_received, std::memory_order_relaxed);
     this->render_nondraining_us_.store(render_nondraining_us, std::memory_order_relaxed);
+    this->dbg_inflight_us_.store(dbg_inflight_us, std::memory_order_relaxed);
     this->as_of_lo_.store(static_cast<uint32_t>(static_cast<uint64_t>(as_of_us)), std::memory_order_relaxed);
     this->as_of_hi_.store(static_cast<uint32_t>(static_cast<uint64_t>(as_of_us) >> 32), std::memory_order_relaxed);
     this->seq_.store(seq + 2, std::memory_order_release);  // even: stable
@@ -137,6 +142,7 @@ class DepthPublisher {
       const uint32_t d_sc = this->dbg_src_consumed_.load(std::memory_order_relaxed);
       const uint32_t d_kr = this->dbg_sink_received_.load(std::memory_order_relaxed);
       const uint32_t nd = this->render_nondraining_us_.load(std::memory_order_relaxed);
+      const uint32_t d_if = this->dbg_inflight_us_.load(std::memory_order_relaxed);
       if (this->seq_.load(std::memory_order_acquire) == before) {
         depth.microseconds = us;
         depth.as_of_us = static_cast<int64_t>((hi << 32) | lo);
@@ -148,6 +154,7 @@ class DepthPublisher {
         depth.dbg_src_consumed = d_sc;
         depth.dbg_sink_received = d_kr;
         depth.render_nondraining_us = nd;
+        depth.dbg_inflight_us = d_if;
         return true;
       }
     }
@@ -163,6 +170,7 @@ class DepthPublisher {
   std::atomic<uint32_t> as_of_hi_{0};
   // TEMPORARY DIAGNOSTIC, see AudioDepth.
   std::atomic<uint32_t> dbg_own_us_{0};
+  std::atomic<uint32_t> dbg_inflight_us_{0};
   std::atomic<uint32_t> dbg_xfer_us_{0};
   std::atomic<uint32_t> dbg_queued_us_{0};
   std::atomic<uint32_t> dbg_dma_us_{0};

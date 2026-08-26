@@ -157,6 +157,10 @@ class MixerSpeaker final : public Component {
   uint32_t get_dbg_sink_queued_us() const { return this->dbg_sink_queued_us_; }
   uint32_t get_dbg_sink_dma_us() const { return this->dbg_sink_dma_us_; }
   uint32_t get_dbg_sink_received() const { return this->dbg_sink_received_; }
+  /// @brief Audio that has left the transfer buffer but is not yet in the sink's published
+  /// snapshot, in us. See where it is computed for why the total is wrong without it.
+  /// @note Mixer task only.
+  uint32_t get_dbg_sink_inflight_us() const { return this->dbg_sink_inflight_us_; }
 
   void dump_config() override;
   void setup() override;
@@ -215,6 +219,13 @@ class MixerSpeaker final : public Component {
   uint32_t dbg_sink_queued_us_{0};
   uint32_t dbg_sink_dma_us_{0};
   uint32_t dbg_sink_received_{0};
+  uint32_t dbg_sink_inflight_us_{0};
+  /// @brief Cumulative output-format frames this mixer has handed to the sink. The sink publishes
+  /// the matching count of what it has ACCEPTED (``dbg_sink_received``), so the difference is
+  /// exactly the audio in flight between the two -- which is the term the composite depth used to
+  /// omit. Wraps at 2^32 frames (~27 h at 44.1 kHz) in step with the sink's counter, and unsigned
+  /// subtraction is correct across the wrap. Mixer task only.
+  uint32_t dbg_written_to_sink_frames_{0};
   int64_t depth_debug_last_us_{0};  // TEMPORARY: time-throttles the DEPTH diagnostic
   optional<audio::AudioStreamInfo> audio_stream_info_;
 

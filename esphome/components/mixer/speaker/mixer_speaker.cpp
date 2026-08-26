@@ -351,7 +351,8 @@ size_t SourceSpeaker::process_data_from_source(std::shared_ptr<audio::RingBuffer
                        this->parent_->get_dbg_sink_queued_us(), this->parent_->get_dbg_sink_dma_us(),
                        this->dbg_received_frames_.load(std::memory_order_relaxed),
                        this->dbg_consumed_frames_.load(std::memory_order_relaxed),
-                       this->parent_->get_dbg_sink_received(), this->parent_->get_downstream_nondraining_us());
+                       this->parent_->get_dbg_sink_received(), this->parent_->get_downstream_nondraining_us(),
+                       this->parent_->get_dbg_sink_inflight_us());
 
   // TEMPORARY DIAGNOSTIC: see the matching line in the mixer task. Remove once explained.
   //
@@ -582,6 +583,8 @@ void MixerSpeaker::audio_mixer_task(void *params) {
       // window between the sink's publish and this read, because the mixer is the only thing that
       // feeds the sink and its previous transfer predates that publish.
       uint32_t sink_us = 0, sink_audio_us = 0, sink_nondraining_us = 0;
+      uint32_t sink_received_frames = 0;
+      bool have_sink_received = false;
       int64_t downstream_as_of_us = esp_timer_get_time();
       if (this_mixer->output_speaker_ != nullptr) {
         audio::AudioDepth sink_latency, sink_audio;
@@ -606,21 +609,56 @@ void MixerSpeaker::audio_mixer_task(void *params) {
           this_mixer->dbg_sink_queued_us_ = sink_audio.dbg_queued_us;
           this_mixer->dbg_sink_dma_us_ = sink_audio.dbg_dma_us;
           this_mixer->dbg_sink_received_ = sink_audio.dbg_sink_received;
+          have_sink_received = true;
+          sink_received_frames = sink_audio.dbg_sink_received;
         }
       }
       this_mixer->downstream_as_of_us_ = downstream_as_of_us;
       this_mixer->dbg_xfer_us_ = this_mixer->audio_stream_info_.value().frames_to_microseconds(
           this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->available()));
-      // The transfer buffer holds only real mixed audio, so it counts toward both.
+
+      // AUDIO IN FLIGHT TO THE SINK. Reading the transfer buffer and the sink's snapshot both before
+      // the transfer below is not enough to make them coherent, and the comment above overstated the
+      // case: it assumed this mixer's last transfer predates the sink's last publish. It usually does
+      // not. The sink publishes on its own DMA cadence -- tens of milliseconds -- while this loop
+      // iterates far faster, so most iterations transfer audio AFTER the sink's snapshot was taken.
+      // That audio is gone from the transfer buffer read here and absent from the snapshot read here,
+      // so the composite counted it in NEITHER, under-reporting by up to one publish interval.
+      //
+      // Measured downstream, where it does real damage: a consumer differencing its own accounting
+      // against this total saw a steady 25.5 ms split -- 1125 frames, matching the conservation
+      // residual to 1 us -- held long enough to pass every steadiness test and trigger its
+      // self-repair, which then created an equal split of the opposite sign that a second repair
+      // answered. Two corrections, neither needed, and the audio ended up ~85 us out on a logic
+      // analyser against a 1-3 us noise floor.
+      //
+      // The bridge needs no timing assumption. Both sides of this boundary keep a CUMULATIVE frame
+      // count -- what this mixer has handed over, and what the sink says it has accepted -- so their
+      // difference is precisely the audio between them, whatever the relative age of the two reads.
+      // Unsigned subtraction stays correct across the 2^32 wrap because both counters wrap together.
+      uint32_t sink_inflight_us = 0;
+      if (have_sink_received) {
+        const uint32_t inflight_frames = this_mixer->dbg_written_to_sink_frames_ - sink_received_frames;
+        // A sink restart zeroes its counter while ours keeps running, which would read as an enormous
+        // in-flight term. Nothing legitimate is more than a second deep between these two stages, so
+        // treat anything larger as a counter mismatch and contribute nothing until they line up again.
+        if (inflight_frames <= this_mixer->audio_stream_info_.value().get_sample_rate()) {
+          sink_inflight_us = this_mixer->audio_stream_info_.value().frames_to_microseconds(inflight_frames);
+        }
+      }
+      this_mixer->dbg_sink_inflight_us_ = sink_inflight_us;
+
+      // The transfer buffer holds only real mixed audio, so it counts toward both. So does the audio
+      // in flight to the sink: it is real mixed audio too, and it is still going to be played.
       this_mixer->downstream_audio_us_.store(
           this_mixer->audio_stream_info_.value().frames_to_microseconds(
               this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->available())) +
-              sink_audio_us,
+              sink_inflight_us + sink_audio_us,
           std::memory_order_release);
       this_mixer->downstream_latency_us_.store(
           this_mixer->audio_stream_info_.value().frames_to_microseconds(
               this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->available())) +
-              sink_us,
+              sink_inflight_us + sink_us,
           std::memory_order_release);
       this_mixer->downstream_nondraining_us_.store(sink_nondraining_us, std::memory_order_release);
 
@@ -636,14 +674,18 @@ void MixerSpeaker::audio_mixer_task(void *params) {
         this_mixer->depth_debug_last_us_ = depth_debug_now;
         const uint32_t xfer_us = this_mixer->audio_stream_info_.value().frames_to_microseconds(
             this_mixer->audio_stream_info_.value().bytes_to_frames(output_transfer_buffer->available()));
-        ESP_LOGD(TAG, "DEPTH xfer=%" PRIu32 " sink_audio=%" PRIu32 " sink_lat=%" PRIu32 " age=%" PRId64,
-                 xfer_us, sink_audio_us, sink_us, esp_timer_get_time() - downstream_as_of_us);
+        ESP_LOGD(TAG,
+                 "DEPTH xfer=%" PRIu32 " inflight=%" PRIu32 " sink_audio=%" PRIu32 " sink_lat=%" PRIu32
+                 " age=%" PRId64,
+                 xfer_us, sink_inflight_us, sink_audio_us, sink_us, esp_timer_get_time() - downstream_as_of_us);
       }
 
       // Hand audio to the sink only AFTER publishing the pair above, so the two terms describe the
       // same instant. Never shift the data in the output transfer buffer to avoid unnecessary, slow
       // data moves.
-      output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false);
+      const size_t transferred_bytes = output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false);
+      this_mixer->dbg_written_to_sink_frames_ +=
+          this_mixer->audio_stream_info_.value().bytes_to_frames(transferred_bytes);
 
       // Free space is read after the transfer on purpose: this one wants the post-transfer figure,
       // since it bounds how much this iteration may mix in.
@@ -758,6 +800,9 @@ void MixerSpeaker::audio_mixer_task(void *params) {
             this_mixer->output_speaker_->start();
             // Reset pipeline frame count since we're starting fresh with a new sample rate
             this_mixer->frames_in_pipeline_.store(0, std::memory_order_release);
+            // The sink was restarted, so its accepted-frames counter starts over and ours has to as
+            // well or the in-flight bridge above compares two unrelated origins.
+            this_mixer->dbg_written_to_sink_frames_ = 0;
             sent_finished = false;
           }
         }
