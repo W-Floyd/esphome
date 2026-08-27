@@ -217,8 +217,24 @@ void SourceSpeaker::loop() {
 }
 
 size_t SourceSpeaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_wait) {
+  // WEDGE DIAGNOSTIC. A write requests a start only when the speaker is STOPPED. In a transitional
+  // state it neither starts nor writes -- the weak ring-buffer reference below has expired, so the
+  // write returns 0 with no error reported anywhere, and the caller cannot tell "not started yet"
+  // from "refusing data".
+  //
+  // Measured on a forced reconnect: when the speaker reached STOPPED the very next play() started
+  // it and the board recovered in ~5 s ("START requested" in the log). When it wedged, no start was
+  // EVER requested -- so it never reached STOPPED, and the mixer task that would advance it had
+  // already been deallocated. This says which state it is actually sitting in.
   if (this->is_stopped()) {
     this->start();
+  } else if (this->state_ != speaker::STATE_RUNNING) {
+    const uint32_t now = millis();
+    if (now - this->dbg_state_log_ms_ >= 1000) {
+      this->dbg_state_log_ms_ = now;
+      ESP_LOGW(TAG, "SourceSpeaker not accepting audio: state=%d ring_valid=%d -- no start will be requested",
+               static_cast<int>(this->state_), this->ring_buffer_.lock().use_count() > 0 ? 1 : 0);
+    }
   }
   size_t bytes_written = 0;
   std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();

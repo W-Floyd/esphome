@@ -121,6 +121,8 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
 
   uint32_t buffer_duration_ms_;
   uint32_t last_seen_data_ms_{0};
+  /// Throttle for the not-accepting-audio diagnostic; see SourceSpeaker::play().
+  uint32_t dbg_state_log_ms_{0};
   optional<uint32_t> timeout_ms_;
   bool stop_gracefully_{false};
 
