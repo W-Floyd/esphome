@@ -465,7 +465,17 @@ void MixerSpeaker::loop() {
   }
   if (event_group_bits & MIXER_TASK_STATE_STOPPED) {
     this->task_.deallocate();
-    ESP_LOGD(TAG, "Stopped");
+    // WEDGE DIAGNOSTIC (1 of 2). This handler clears ALL bits, so a MIXER_TASK_COMMAND_START set
+    // between the top of loop() and here is discarded along with the state bits -- after which the
+    // task is deallocated, nothing re-requests a start, and the speaker is silent until a replug.
+    // Observed three times in one afternoon, always entered the same way: a supply outage, a
+    // reconnect, "Stopped", then a session that reports PLAYING with dma_real=0 forever.
+    //
+    // The bits are RE-READ here rather than taken from the top of loop(): a start arriving in that
+    // window is exactly the race in question, and the stale copy cannot show it.
+    const uint32_t bits_at_clear = xEventGroupGetBits(this->event_group_);
+    ESP_LOGD(TAG, "Stopped (bits=0x%06" PRIX32 "%s)", bits_at_clear,
+             (bits_at_clear & MIXER_TASK_COMMAND_START) ? " -- CLEARING A PENDING START" : "");
     xEventGroupClearBits(this->event_group_, MIXER_TASK_ALL_BITS);
     this->all_stopped_since_ms_ = 0;
   }
@@ -521,6 +531,12 @@ esp_err_t MixerSpeaker::start(audio::AudioStreamInfo &stream_info) {
   xEventGroupClearBits(this->event_group_, MIXER_TASK_COMMAND_STOP);
 
   uint32_t event_bits = xEventGroupGetBits(this->event_group_);
+  // WEDGE DIAGNOSTIC (2 of 2). The open question is whether a start is ISSUED AND LOST or NEVER
+  // ISSUED: both end with no "Starting" line, and no fix can be chosen until they are told apart.
+  // This is the only place a start is requested, so its absence in a log is the second answer.
+  ESP_LOGD(TAG, "START requested (bits=0x%06" PRIX32 ", task %s, already pending %s)", event_bits,
+           this->task_.is_created() ? "created" : "not created",
+           (event_bits & MIXER_TASK_COMMAND_START) ? "yes" : "no");
   if (!(event_bits & MIXER_TASK_COMMAND_START)) {
     // Set MIXER_TASK_COMMAND_START bit if not already set, and then immediately wake for low latency
     xEventGroupSetBits(this->event_group_, MIXER_TASK_COMMAND_START);
