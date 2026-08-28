@@ -13,6 +13,7 @@
 
 #include "esp_timer.h"
 
+#include <algorithm>
 #include <cinttypes>
 
 // esp-audio-libs
@@ -193,6 +194,12 @@ void I2SAudioSpeaker::run_speaker_task() {
     // write_records_queue_. Separates the caller's own audio from the silence padding that shares
     // those descriptors, which render_latency() counts and buffered_audio() must not.
     uint32_t dma_real_frames = 0;
+    // ISR timestamp of the most recent descriptor completion, i.e. the last DMA buffer BOUNDARY.
+    // The render latency below needs it: the descriptors are always full, so a frame handed over now
+    // waits for every descriptor ahead of it PLUS the part of the head descriptor that has not been
+    // clocked out yet, and the only way to know that part is the time since the last boundary.
+    // 0 until the first completion, where the full span is the honest answer.
+    int64_t last_completion_us = 0;
     uint32_t last_data_received_time = millis();
     // TEMPORARY DIAGNOSTIC: cumulative real frames written into descriptors and confirmed played.
     // dma_real_frames is maintained as their difference, so logging all three shows whether it is
@@ -256,6 +263,8 @@ void I2SAudioSpeaker::run_speaker_task() {
         }
         dma_real_frames -= std::min(dma_real_frames, real_frames);
         dbg_completed_real += real_frames;
+        // Latest boundary wins: several completions can drain in one iteration after a scheduling gap.
+        last_completion_us = write_timestamp;
         if (real_frames > 0) {
           pending_real_buffers--;
           // Real audio is packed at the start of each DMA buffer with any silence padding on the
@@ -312,9 +321,36 @@ void I2SAudioSpeaker::run_speaker_task() {
       // -- the ring counted by queued_us -- drains normally. Reported so a consumer ageing a stale
       // snapshot can age only the queue; see AudioDepth::render_nondraining_us for what goes wrong
       // when that split is guessed instead.
-      const uint32_t dma_span_us =
+      //
+      // REMAINING, NOT CAPACITY, and that distinction was worth 3.7-13 ms of planted playout offset
+      // in a consumer that seeds its frame accounting from this number.
+      //
+      // dma_resident_bytes_ is the CAPACITY: it is stored once at task start and zeroed on stop, and
+      // since this writer keeps every descriptor full it is a true statement of how many bytes are
+      // resident. It is the wrong quantity anyway. A frame handed over now goes into the descriptor
+      // that just freed, so it waits for the DESCRIPTORS AHEAD OF IT plus only the UNPLAYED REMAINDER
+      // of the head descriptor -- not the whole head descriptor. Reporting capacity therefore
+      // over-states by however much of the head has already been clocked out: zero just after a
+      // boundary, a full descriptor just before the next one.
+      //
+      // MEASURED IN A CONSUMER (2026-08-28, snapcast client seeding its accounting off this value):
+      // every seed onto a dry pipeline read latency=50000 EXACTLY, never once less, against
+      // DMA_BUFFER_DURATION_MS 10 x DMA_BUFFERS_COUNT 5 = a 50 ms span. The offsets that seed planted
+      // were 3.7-13 ms, i.e. uniform over one descriptor, which is exactly this error's range.
+      //
+      // Time since the last boundary is the head's played part. Clamped to one descriptor because
+      // several completions can drain in one iteration, which would otherwise subtract more than one
+      // descriptor's worth.
+      const uint32_t dma_capacity_us =
           this->output_stream_info_.frames_to_microseconds(this->output_stream_info_.bytes_to_frames(
               this->dma_resident_bytes_.load(std::memory_order_relaxed)));
+      const uint32_t dma_buffer_us = this->output_stream_info_.frames_to_microseconds(frames_per_dma_buffer);
+      uint32_t head_played_us = 0;
+      if (last_completion_us != 0) {
+        const int64_t since_boundary = esp_timer_get_time() - last_completion_us;
+        head_played_us = static_cast<uint32_t>(std::clamp<int64_t>(since_boundary, 0, dma_buffer_us));
+      }
+      const uint32_t dma_span_us = dma_capacity_us - std::min(dma_capacity_us, head_played_us);
       this->depth_.publish(
           queued_us + dma_span_us,
           queued_us + this->current_stream_info_.frames_to_microseconds(dma_real_frames), esp_timer_get_time(), 0, 0,
