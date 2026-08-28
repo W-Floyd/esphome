@@ -338,19 +338,44 @@ void I2SAudioSpeaker::run_speaker_task() {
       // DMA_BUFFER_DURATION_MS 10 x DMA_BUFFERS_COUNT 5 = a 50 ms span. The offsets that seed planted
       // were 3.7-13 ms, i.e. uniform over one descriptor, which is exactly this error's range.
       //
-      // Time since the last boundary is the head's played part. Clamped to one descriptor because
-      // several completions can drain in one iteration, which would otherwise subtract more than one
-      // descriptor's worth.
+      // REPORT THE SAWTOOTH'S MEAN, NOT ITS INSTANTANEOUS VALUE, and the reason is that this
+      // publish instant is NOT independent of the descriptor cycle.
+      //
+      // The first attempt at this subtracted (now - last_completion_us), the head's played part, on
+      // the reasoning that it is exact at the instant of publication. It is -- and that is the
+      // problem. This loop is PACED BY i2s_channel_write(), which returns when a descriptor frees,
+      // and the publish sits immediately after the completion drain. So the publish always happens
+      // just after a boundary, the head's played part is always near zero, and the reported value is
+      // always near capacity. Measured: held=49600 against a 50000 capacity, i.e. 400 us subtracted
+      // where the mean error is 5000.
+      //
+      // Meanwhile the CONSUMER reads this snapshot ~20 ms stale (measured age=20483, two descriptor
+      // periods), so it samples the sawtooth at effectively random phase, where the true remaining
+      // averages capacity - buffer/2. Publishing the instantaneous value therefore hands a
+      // random-phase reader a systematically HIGH number.
+      //
+      //   instantaneous  ~49.6 ms published, truth averages 45.0 ms  ->  +5 ms bias, +-5 ms spread
+      //   sawtooth mean   45.0 ms published, any phase               ->   0 bias,      0 spread
+      //
+      // So for a reader that cannot be fresh, the mean is strictly better on both terms. The cost is
+      // that a HYPOTHETICAL fresh reader would now be wrong by up to +-5 ms where it could have been
+      // exact -- acceptable, because nothing reads this fresh: the sink publishes on its own DMA
+      // cadence and every consumer is at least one descriptor behind by construction.
+      //
+      // WHY THIS MATTERS DOWNSTREAM: a consumer seeding its frame accounting from this value turns
+      // the error straight into a playout offset. Those seeds were measured planting 3.7-13 ms, and
+      // a 3.6 ms transient was caught live on 2026-08-28 -- the device unmuted reporting
+      // "median -8 us" while a logic analyser had it 3.6 ms out, then spent ~20 s at 178 ppm walking
+      // it back. This removes the systematic part of what it has to walk.
+      //
+      // last_completion_us is kept, unused for the span, because it is the only handle on the
+      // descriptor phase and the next attempt at this will want it.
+      (void) last_completion_us;
       const uint32_t dma_capacity_us =
           this->output_stream_info_.frames_to_microseconds(this->output_stream_info_.bytes_to_frames(
               this->dma_resident_bytes_.load(std::memory_order_relaxed)));
       const uint32_t dma_buffer_us = this->output_stream_info_.frames_to_microseconds(frames_per_dma_buffer);
-      uint32_t head_played_us = 0;
-      if (last_completion_us != 0) {
-        const int64_t since_boundary = esp_timer_get_time() - last_completion_us;
-        head_played_us = static_cast<uint32_t>(std::clamp<int64_t>(since_boundary, 0, dma_buffer_us));
-      }
-      const uint32_t dma_span_us = dma_capacity_us - std::min(dma_capacity_us, head_played_us);
+      const uint32_t dma_span_us = dma_capacity_us - std::min(dma_capacity_us, dma_buffer_us / 2);
       this->depth_.publish(
           queued_us + dma_span_us,
           queued_us + this->current_stream_info_.frames_to_microseconds(dma_real_frames), esp_timer_get_time(), 0, 0,
