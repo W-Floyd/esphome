@@ -10,6 +10,8 @@
 
 #include "esp_err.h"
 
+#include <cstdint>  // for SIZE_MAX
+
 #include <freertos/FreeRTOS.h>
 
 namespace esphome::audio {
@@ -101,7 +103,11 @@ class AudioSinkTransferBuffer : public AudioTransferBuffer {
   /// @param post_shift If true, all remaining data is moved to the start of the buffer after transferring to the sink.
   ///                   Defaults to true.
   /// @return Number of bytes written
-  size_t transfer_data_to_sink(TickType_t ticks_to_wait, bool post_shift = true);
+  /// @param max_bytes Upper bound on this transfer. Defaults to everything available. A caller that
+  /// attaches an identity to what it hands the sink uses this to stop the transfer at the point that
+  /// identity stops applying -- handing over one contiguous run per call rather than a span whose
+  /// later frames belong to something the sink was never told about.
+  size_t transfer_data_to_sink(TickType_t ticks_to_wait, bool post_shift = true, size_t max_bytes = SIZE_MAX);
 
   /// @brief Adds a ring buffer as the transfer buffer's sink.
   /// @param ring_buffer weak_ptr to the allocated ring buffer

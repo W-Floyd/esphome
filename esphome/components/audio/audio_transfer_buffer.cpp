@@ -2,6 +2,7 @@
 
 #ifdef USE_ESP32
 
+#include <algorithm>
 #include <cstring>
 
 #include "esphome/core/helpers.h"
@@ -153,19 +154,20 @@ size_t AudioSourceTransferBuffer::transfer_data_from_source(TickType_t ticks_to_
   return bytes_read;
 }
 
-size_t AudioSinkTransferBuffer::transfer_data_to_sink(TickType_t ticks_to_wait, bool post_shift) {
+size_t AudioSinkTransferBuffer::transfer_data_to_sink(TickType_t ticks_to_wait, bool post_shift, size_t max_bytes) {
   size_t bytes_written = 0;
-  if (this->available()) {
+  const size_t to_write = std::min(this->available(), max_bytes);
+  if (to_write > 0) {
 #ifdef USE_SPEAKER
     if (this->speaker_ != nullptr) {
-      bytes_written = this->speaker_->play(this->data_start_, this->available(), ticks_to_wait);
+      bytes_written = this->speaker_->play(this->data_start_, to_write, ticks_to_wait);
     } else
 #endif
         if (this->ring_buffer_.use_count() > 0) {
       bytes_written =
-          this->ring_buffer_->write_without_replacement((void *) this->data_start_, this->available(), ticks_to_wait);
+          this->ring_buffer_->write_without_replacement((void *) this->data_start_, to_write, ticks_to_wait);
     } else if (this->sink_callback_ != nullptr) {
-      bytes_written = this->sink_callback_->audio_sink_write(this->data_start_, this->available(), ticks_to_wait);
+      bytes_written = this->sink_callback_->audio_sink_write(this->data_start_, to_write, ticks_to_wait);
     }
 
     this->decrease_buffer_length(bytes_written);

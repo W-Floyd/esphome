@@ -133,12 +133,24 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
   std::shared_ptr<audio::RingBufferAudioSource> audio_source_;
   std::weak_ptr<ring_buffer::RingBuffer> ring_buffer_;
 
-  /// @brief Tag covering the next ``frames`` this source is about to hand the mixer, advancing the
-  /// read position past them.
+  /// @brief Copies the identity of the next ``frames`` this source is about to hand the mixer into
+  /// ``dest``, SPLIT AT EVERY TAG BOUNDARY, and advances the read position past them.
+  ///
+  /// Splitting is the whole point. Sampling one tag for the block and calling that its identity
+  /// discards every boundary inside it, and the survivor is then stretched over the gap by the
+  /// contiguity assumption -- which holds right up until the producer inserts or drops a frame, the
+  /// one case worth measuring. Measured before this existed: 78% of readings had been extrapolated
+  /// past at least one chunk boundary, up to 2.6 chunks (69 ms), because a mixed block is routinely
+  /// larger than the 1152-frame chunk it starts in.
+  ///
   /// @note MIXER TASK ONLY, called once per mixing pass in the same order the frames are consumed.
-  /// Must be called for every consumed block, blended ones included, or the position stops matching
-  /// the ring and every later lookup names the wrong audio.
-  audio::RenderTag take_render_tag(uint32_t frames);
+  void forward_render_tags(uint32_t frames, audio::RenderTagTrack &dest);
+
+  /// @brief Advances the read position past ``frames`` without recording their identity, for audio
+  /// whose identity cannot survive -- a blend of two sources.
+  /// @note MIXER TASK ONLY. Must be called for every consumed block that forward_render_tags() did
+  /// not take, or the position stops matching the ring and every later lookup names the wrong audio.
+  void drop_render_tags(uint32_t frames) { this->tag_consumed_frames_ += frames; }
 
   /// Render tags bound to positions in this source's ring: written by play(), read by the mixer task.
   audio::RenderTagTrack tag_track_;

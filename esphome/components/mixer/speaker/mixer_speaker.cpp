@@ -15,6 +15,7 @@
 #include <pcm_convert.h>  // esp-audio-libs
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 
 namespace esphome::mixer_speaker {
@@ -424,10 +425,18 @@ bool SourceSpeaker::supports_render_tags() const {
 }
 
 // THREAD CONTEXT: mixer task
-audio::RenderTag SourceSpeaker::take_render_tag(uint32_t frames) {
-  const audio::RenderTag tag = this->tag_track_.tag_at(this->tag_consumed_frames_);
+void SourceSpeaker::forward_render_tags(uint32_t frames, audio::RenderTagTrack &dest) {
+  uint32_t done = 0;
+  while (done < frames) {
+    uint32_t run = 0;
+    const audio::RenderTag tag = this->tag_track_.tag_at(this->tag_consumed_frames_ + done, &run);
+    // run is the distance to the next recorded discontinuity and is never zero, so this terminates.
+    const uint32_t segment = std::min(frames - done, run);
+    dest.set_next(tag);
+    dest.note_written(segment);
+    done += segment;
+  }
   this->tag_consumed_frames_ += frames;
-  return tag;
 }
 
 void SourceSpeaker::apply_ducking(uint8_t decibel_reduction, uint32_t duration) {
@@ -762,17 +771,35 @@ void MixerSpeaker::audio_mixer_task(void *params) {
       // same instant. Never shift the data in the output transfer buffer to avoid unnecessary, slow
       // data moves.
       //
-      // The sink is told the identity of the FIRST frame this transfer will hand it, which is the
-      // frame at the current read position -- the transfer buffer sits between the mixing above and
-      // this write, so the tag attached here is generally not the one attached most recently. An
-      // untagged answer is passed on as untagged, which is what suppresses a reading for blended or
-      // producer-inserted audio.
-      if (this_mixer->output_speaker_->supports_render_tags()) {
-        this_mixer->output_speaker_->set_next_render_tag(
-            this_mixer->out_tag_track_.tag_at(this_mixer->tag_sent_frames_));
+      // The sink is told the identity of the frames it is about to receive, and the transfer is CAPPED
+      // at the point that identity stops applying. Handing over a span that crosses a boundary would
+      // tell the sink one thing about audio that is partly something else -- and the sink cannot
+      // detect that, because a play() call carries one tag.
+      //
+      // Segmented rather than one-shot: the transfer buffer sits between the mixing above and this
+      // write, so it routinely holds audio spanning several source chunks. The bound is a safety
+      // valve, not a limit reached in practice -- runs are chunk-sized (1152 frames, 26 ms) against a
+      // transfer buffer of a few tens of ms -- and it guarantees the loop cannot stall the task even
+      // if a pathological run length ever appeared.
+      size_t transferred_bytes = 0;
+      for (uint8_t segment = 0; segment < 4; segment++) {
+        size_t cap = SIZE_MAX;
+        if (this_mixer->output_speaker_->supports_render_tags()) {
+          uint32_t run = 0;
+          this_mixer->output_speaker_->set_next_render_tag(
+              this_mixer->out_tag_track_.tag_at(this_mixer->tag_sent_frames_, &run));
+          if (run != UINT32_MAX) {
+            cap = this_mixer->audio_stream_info_.value().frames_to_bytes(run);
+          }
+        }
+        const size_t n = output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false, cap);
+        transferred_bytes += n;
+        this_mixer->tag_sent_frames_ += this_mixer->audio_stream_info_.value().bytes_to_frames(n);
+        if (n == 0 || n < cap || output_transfer_buffer->available() == 0) {
+          // Sink full, or this run is not what limited the transfer: nothing more to segment.
+          break;
+        }
       }
-      const size_t transferred_bytes = output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false);
-      this_mixer->tag_sent_frames_ += this_mixer->audio_stream_info_.value().bytes_to_frames(transferred_bytes);
       this_mixer->dbg_written_to_sink_frames_ +=
           this_mixer->audio_stream_info_.value().bytes_to_frames(transferred_bytes);
 
@@ -873,10 +900,10 @@ void MixerSpeaker::audio_mixer_task(void *params) {
 
           // One source, so its identity IS the output's identity: frames cross unblended and the
           // conversion above changes sample width and channel count, never the frame count the tag's
-          // offset is measured in.
+          // offset is measured in. Copied boundary by boundary rather than sampled once -- see
+          // forward_render_tags() for what sampling once threw away.
           this_mixer->tag_owner_.store(speakers_with_data[0], std::memory_order_release);
-          this_mixer->out_tag_track_.set_next(speakers_with_data[0]->take_render_tag(frames_to_mix));
-          this_mixer->out_tag_track_.note_written(frames_to_mix);
+          speakers_with_data[0]->forward_render_tags(frames_to_mix, this_mixer->out_tag_track_);
 
           // Update source speaker pending frames
           speakers_with_data[0]->pending_playback_frames_.fetch_add(frames_to_mix, std::memory_order_release);
@@ -957,7 +984,7 @@ void MixerSpeaker::audio_mixer_task(void *params) {
           // Advance every contributor's read position even though the tag is discarded: the position
           // tracks the RING, and a source skipped here would have every later lookup naming audio
           // this many frames too early.
-          speakers_with_data[i]->take_render_tag(frames_to_mix);
+          speakers_with_data[i]->drop_render_tags(frames_to_mix);
           audio_sources_with_data[i]->consume(
               speakers_with_data[i]->get_audio_stream_info().frames_to_bytes(frames_to_mix));
         }

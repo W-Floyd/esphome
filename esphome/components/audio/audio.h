@@ -115,16 +115,39 @@ class RenderTagTrack {
   }
 
   /// @brief The tag covering stream frame ``read_pos``, with ``offset_frames`` advanced to that frame.
+  ///
+  /// @param read_pos Stream frame to identify.
+  /// @param run_frames If given, receives how many frames from ``read_pos`` this answer stays valid
+  /// for -- the distance to the next recorded discontinuity, or UINT32_MAX when none is recorded.
+  /// A CALLER HANDLING A BLOCK OF FRAMES MUST USE THIS. The returned tag describes ``read_pos`` and
+  /// is extended to later frames only by assuming the audio between them is contiguous; that
+  /// assumption is exactly what breaks where the producer inserted or dropped frames, which is the
+  /// case the measurement exists to catch. Treating one lookup as covering a whole block silently
+  /// discards every boundary inside it.
+  ///
   /// @return An INVALID tag when that frame is not covered -- it predates the oldest retained tag, or
   /// the producer explicitly marked the run untagged. Never a guess.
-  RenderTag tag_at(uint64_t read_pos) const {
+  ///
+  /// @note An evicted tag needs no special case. Entries are evicted oldest-first and positions only
+  /// increase, so if the oldest survivor is at P then every entry after P survives too: a ``read_pos``
+  /// at or after P is covered exactly, and one before P matches no entry at all and reads invalid.
+  RenderTag tag_at(uint64_t read_pos, uint32_t *run_frames = nullptr) const {
     LockGuard guard(this->mutex_);
     const Entry *best = nullptr;
+    uint64_t next_pos = UINT64_MAX;
     for (size_t i = 0; i < this->count_; i++) {
       const Entry &entry = this->entries_[i];
-      if (entry.pos <= read_pos && (best == nullptr || entry.pos > best->pos)) {
-        best = &entry;
+      if (entry.pos <= read_pos) {
+        if (best == nullptr || entry.pos > best->pos) {
+          best = &entry;
+        }
+      } else if (entry.pos < next_pos) {
+        next_pos = entry.pos;
       }
+    }
+    if (run_frames != nullptr) {
+      const uint64_t run = next_pos == UINT64_MAX ? UINT64_MAX : next_pos - read_pos;
+      *run_frames = run > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(run);
     }
     if (best == nullptr || !best->tag.valid()) {
       return RenderTag{};
