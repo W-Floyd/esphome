@@ -83,6 +83,8 @@ struct SourceBinding : public media_source::MediaSourceListener {
   void report_state(media_source::MediaSourceState state) override;
   bool render_latency(audio::AudioDepth &depth) const override;
   bool buffered_audio(audio::AudioDepth &depth) const override;
+  void set_next_render_tag(const audio::RenderTag &tag) override;
+  bool supports_render_tags() const override;
   void request_volume(float volume) override;
   void request_mute(bool is_muted) override;
   void request_play_uri(const std::string &uri) override;
@@ -195,6 +197,12 @@ class SpeakerSourceMediaPlayer final : public Component, public media_player::Me
   void handle_play_uri_request_(uint8_t pipeline, const std::string &uri);
 
   void handle_speaker_playback_callback_(uint32_t frames, int64_t timestamp, uint8_t pipeline);
+
+  /// @brief Forwards a tagged render to whichever source is active on that pipeline.
+  /// @note Speaker callback task, like handle_speaker_playback_callback_(). Deliberately does NOT
+  /// touch ``pending_frames``: the untagged callback already does that accounting, and this fires
+  /// alongside it for the same audio, so debiting here would double-count.
+  void handle_speaker_tagged_callback_(uint32_t frames, int64_t adjusted_ts, audio::RenderTag tag, uint8_t pipeline);
 
   // Receives commands from HA or from the voice assistant component
   // Sends commands to the media_control_command_queue_

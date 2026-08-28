@@ -244,6 +244,10 @@ size_t SourceSpeaker::play(const uint8_t *data, size_t length, TickType_t ticks_
     // TEMPORARY DIAGNOSTIC: what the ring actually took.
     this->dbg_received_frames_.fetch_add(this->audio_stream_info_.bytes_to_frames(bytes_written),
                                          std::memory_order_relaxed);
+    // Bind any pending tag at the position the audio actually landed at, not the position it was
+    // offered at: the ring may take less than was offered, and a short write counted in full would
+    // slide every later tag forward by the shortfall.
+    this->tag_track_.note_written(this->audio_stream_info_.bytes_to_frames(bytes_written));
     if (bytes_written > 0) {
       this->last_seen_data_ms_ = millis();
     }
@@ -277,6 +281,10 @@ esp_err_t SourceSpeaker::start_() {
     std::shared_ptr<ring_buffer::RingBuffer> temp_ring_buffer = this->ring_buffer_.lock();
     if (!temp_ring_buffer) {
       temp_ring_buffer = ring_buffer::RingBuffer::create(ring_buffer_size);
+      // Restart both ends of the tag stream before the ring is reachable. play() can only find the
+      // ring through this weak_ptr, so until it is assigned there is no producer to race.
+      this->tag_track_.reset();
+      this->tag_consumed_frames_ = 0;
       this->ring_buffer_ = temp_ring_buffer;
     }
 
@@ -411,6 +419,17 @@ size_t SourceSpeaker::process_data_from_source(std::shared_ptr<audio::RingBuffer
   return bytes_read;
 }
 
+bool SourceSpeaker::supports_render_tags() const {
+  return this->parent_->get_output_speaker()->supports_render_tags() && this->parent_->running_source_count() <= 1;
+}
+
+// THREAD CONTEXT: mixer task
+audio::RenderTag SourceSpeaker::take_render_tag(uint32_t frames) {
+  const audio::RenderTag tag = this->tag_track_.tag_at(this->tag_consumed_frames_);
+  this->tag_consumed_frames_ += frames;
+  return tag;
+}
+
 void SourceSpeaker::apply_ducking(uint8_t decibel_reduction, uint32_t duration) {
   const uint32_t transition_samples = duration > 0 ? this->audio_stream_info_.ms_to_samples(duration) : 0;
   esp_audio_libs::ducking::set_target(this->ducking_state_, decibel_reduction, transition_samples);
@@ -440,8 +459,29 @@ void MixerSpeaker::setup() {
     atomic_subtract_clamped(this->frames_in_pipeline_, new_frames);
   });
 
+  // Tagged renders are delivered to the source that tagged the audio, and only that one. Registered
+  // once here rather than per source: the tag comes back as opaque bytes with no sender attached, so
+  // fanning it out to every source would hand each of them another source's identity.
+  this->output_speaker_->add_tagged_output_callback(
+      [this](uint32_t frames, int64_t adjusted_ts, audio::RenderTag tag) {
+        SourceSpeaker *owner = this->tag_owner_.load(std::memory_order_acquire);
+        if (owner != nullptr) {
+          owner->tagged_output_callback_(frames, adjusted_ts, tag);
+        }
+      });
+
   // Start with loop disabled since no task is running and no commands are pending
   this->disable_loop();
+}
+
+size_t MixerSpeaker::running_source_count() const {
+  size_t running = 0;
+  for (auto &speaker : this->source_speakers_) {
+    if (speaker->is_running()) {
+      running++;
+    }
+  }
+  return running;
 }
 
 void MixerSpeaker::loop() {
@@ -580,6 +620,11 @@ void MixerSpeaker::audio_mixer_task(void *params) {
 
     output_transfer_buffer->set_sink(this_mixer->output_speaker_);
 
+    // Both ends of the mixer->sink tag stream restart with the transfer buffer they describe.
+    this_mixer->out_tag_track_.reset();
+    this_mixer->tag_sent_frames_ = 0;
+    this_mixer->tag_owner_.store(nullptr, std::memory_order_release);
+
     xEventGroupSetBits(this_mixer->event_group_, MIXER_TASK_STATE_RUNNING);
 
     bool sent_finished = false;
@@ -716,7 +761,18 @@ void MixerSpeaker::audio_mixer_task(void *params) {
       // Hand audio to the sink only AFTER publishing the pair above, so the two terms describe the
       // same instant. Never shift the data in the output transfer buffer to avoid unnecessary, slow
       // data moves.
+      //
+      // The sink is told the identity of the FIRST frame this transfer will hand it, which is the
+      // frame at the current read position -- the transfer buffer sits between the mixing above and
+      // this write, so the tag attached here is generally not the one attached most recently. An
+      // untagged answer is passed on as untagged, which is what suppresses a reading for blended or
+      // producer-inserted audio.
+      if (this_mixer->output_speaker_->supports_render_tags()) {
+        this_mixer->output_speaker_->set_next_render_tag(
+            this_mixer->out_tag_track_.tag_at(this_mixer->tag_sent_frames_));
+      }
       const size_t transferred_bytes = output_transfer_buffer->transfer_data_to_sink(pdMS_TO_TICKS(TASK_DELAY_MS), false);
+      this_mixer->tag_sent_frames_ += this_mixer->audio_stream_info_.value().bytes_to_frames(transferred_bytes);
       this_mixer->dbg_written_to_sink_frames_ +=
           this_mixer->audio_stream_info_.value().bytes_to_frames(transferred_bytes);
 
@@ -815,6 +871,13 @@ void MixerSpeaker::audio_mixer_task(void *params) {
             speakers_with_data[0]->has_contributed_.store(true, std::memory_order_release);
           }
 
+          // One source, so its identity IS the output's identity: frames cross unblended and the
+          // conversion above changes sample width and channel count, never the frame count the tag's
+          // offset is measured in.
+          this_mixer->tag_owner_.store(speakers_with_data[0], std::memory_order_release);
+          this_mixer->out_tag_track_.set_next(speakers_with_data[0]->take_render_tag(frames_to_mix));
+          this_mixer->out_tag_track_.note_written(frames_to_mix);
+
           // Update source speaker pending frames
           speakers_with_data[0]->pending_playback_frames_.fetch_add(frames_to_mix, std::memory_order_release);
           speakers_with_data[0]->dbg_consumed_frames_.fetch_add(frames_to_mix, std::memory_order_relaxed);
@@ -891,9 +954,19 @@ void MixerSpeaker::audio_mixer_task(void *params) {
 
           speakers_with_data[i]->pending_playback_frames_.fetch_add(frames_to_mix, std::memory_order_release);
           speakers_with_data[i]->dbg_consumed_frames_.fetch_add(frames_to_mix, std::memory_order_relaxed);
+          // Advance every contributor's read position even though the tag is discarded: the position
+          // tracks the RING, and a source skipped here would have every later lookup naming audio
+          // this many frames too early.
+          speakers_with_data[i]->take_render_tag(frames_to_mix);
           audio_sources_with_data[i]->consume(
               speakers_with_data[i]->get_audio_stream_info().frames_to_bytes(frames_to_mix));
         }
+
+        // A blend has no single identity. Marking the run explicitly untagged is what makes that
+        // structural rather than advisory -- the sink then reports nothing for any descriptor
+        // starting in it, whatever supports_render_tags() happened to say when the caller asked.
+        this_mixer->out_tag_track_.set_next(audio::RenderTag{});
+        this_mixer->out_tag_track_.note_written(frames_to_mix);
 
         // Update output transfer buffer length and pipeline frame count (once, not per source)
         output_transfer_buffer->increase_buffer_length(output_info.frames_to_bytes(frames_to_mix));

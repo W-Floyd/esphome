@@ -69,6 +69,20 @@ class MediaSourceListener {
   /// the sampling phase rather than the accounting.
   virtual bool buffered_audio(audio::AudioDepth & /*depth*/) const { return false; }
 
+  /// @brief Attach an opaque identity to the audio the NEXT ``write_audio()`` hands over, if the
+  /// listener can carry one end to end. See audio::RenderTag and Speaker::set_next_render_tag().
+  ///
+  /// A source that wants to know when a PARTICULAR frame rendered cannot get it from
+  /// notify_audio_played(), which reports a quantity: it would have to infer the answer from its own
+  /// pushed-minus-played ledger, and that inference is blind to a bias in the ledger itself. Stating
+  /// the identity and being handed it back makes the observation captured instead.
+  virtual void set_next_render_tag(const audio::RenderTag & /*tag*/) {}
+
+  /// @brief Whether tags set through ``set_next_render_tag()`` actually come back. False by default,
+  /// and false whenever the identity could not survive the path -- through a resampler, or a mixer
+  /// blending a second source. May change at runtime, so it must not be cached from setup.
+  virtual bool supports_render_tags() const { return false; }
+
   // Callbacks from smart sources requesting the orchestrator to change volume, mute, or start a new URI.
   // Simple sources never invoke these.
   /// @brief Request the orchestrator to change volume
@@ -153,6 +167,18 @@ class MediaSource {
     return false;
   }
 
+  /// @brief Tags the audio the next write_output() hands over (see MediaSourceListener)
+  void output_set_next_render_tag(const audio::RenderTag &tag) {
+    if (this->listener_ != nullptr) {
+      this->listener_->set_next_render_tag(tag);
+    }
+  }
+
+  /// @brief Whether tagging this source's audio yields tagged render reports right now
+  bool output_supports_render_tags() const {
+    return this->listener_ != nullptr && this->listener_->supports_render_tags();
+  }
+
   /// @brief Queries buffered own-audio downstream (see MediaSourceListener::buffered_audio)
   bool output_buffered_audio(audio::AudioDepth &depth) const {
     if (this->listener_ != nullptr) {
@@ -179,6 +205,16 @@ class MediaSource {
   /// @param frames Number of audio frames that were played
   /// @param timestamp System time in microseconds when the frames finished writing to the DAC
   virtual void notify_audio_played(uint32_t frames, int64_t timestamp) {}
+
+  /// @brief Notify the source that audio it TAGGED has been played, handing back the tag.
+  /// Fires alongside notify_audio_played(), never instead of it, and only for a rendered buffer whose
+  /// first frame of real audio carried a valid tag -- so a source hears nothing for padding, for its
+  /// own inserted silence, or for anything blended with another source.
+  /// @param frames Frames of real audio in that buffer
+  /// @param adjusted_ts System time in us at which that buffer's real audio FINISHED rendering, so its
+  /// first real frame -- the one the tag identifies -- rendered that many frames' worth of time earlier
+  /// @param tag The identity the source attached, with ``offset_frames`` advanced to that first frame
+  virtual void notify_audio_played_tagged(uint32_t frames, int64_t adjusted_ts, audio::RenderTag tag) {}
 
  protected:
   /// @brief Update state and notify listener

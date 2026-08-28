@@ -9,6 +9,171 @@
 
 namespace esphome::audio {
 
+/// @brief An opaque IDENTITY a producer attaches to audio it hands down the chain, returned to it when
+/// THAT audio renders.
+///
+/// The played-frames callback reports a QUANTITY -- how many frames rendered, and when -- never WHICH
+/// audio. A caller that wants "when did this particular frame render" has to infer it from its own
+/// pushed-minus-played ledger, and a device cannot detect that its own counter is biased by consulting
+/// that counter: once a servo repairs a ledger bias, the bias and the audio displacement it caused are
+/// equal and opposite inside the subtraction and cancel exactly. Measured against a known 1000 us
+/// displacement, an inferred phase moved by 0.003 of it; an externally planted one by 1.000.
+///
+/// So the identity is CAPTURED rather than inferred: the producer states which audio it is handing over,
+/// and the sink hands that statement back with the render timestamp of that audio. A ledger bias is then
+/// visible IN the measurement rather than invisible TO it.
+///
+/// The contents mean nothing to anything between producer and sink -- they are carried, never
+/// interpreted. For the snapcast client they are the server timestamp of a chunk and the frame offset
+/// into it, because a DMA descriptor (441 frames) is smaller than a chunk (1152 frames) and descriptors
+/// therefore straddle chunks: a bare chunk id could not say WHERE in the chunk a descriptor started.
+struct RenderTag {
+  /// Producer-defined timestamp of the frame at ``offset_frames`` zero. Zero means UNTAGGED.
+  uint64_t server_ts{0};
+  /// Frames from that timestamp's frame to the frame this tag is attached to.
+  uint32_t offset_frames{0};
+
+  /// @brief Whether this tag identifies anything.
+  ///
+  /// Untagged audio is not an error and must not be treated as one: silence padding, servo splices and
+  /// repeat frames are all audio the producer deliberately inserted that corresponds to no server time
+  /// at all. A sink must simply not report a render for audio that starts in such a run -- a wrong tag
+  /// is far worse than no tag, because a wrong one is acted on.
+  bool valid() const { return this->server_ts != 0; }
+};
+
+/// @brief Binds RenderTags to positions in a single ordered frame stream, so a consumer reading that
+/// stream some time later can recover the tag covering any frame it reaches.
+///
+/// One instance describes ONE queue: the producer states a tag and then reports how many frames it
+/// handed over, the consumer asks which tag covers the frame it is about to render. Frames between two
+/// tagged points are contiguous by construction, so a tag covers everything after it until the next
+/// one, with ``offset_frames`` advanced by the distance -- which is why a chunk boundary and a DMA
+/// descriptor boundary need not line up.
+///
+/// A stage that changes the frame count (a resampler) cannot use this: the distance arithmetic is in
+/// frames of one stream. A stage that changes the SAMPLE layout (mono widened to stereo, 32-bit
+/// narrowed to 16) can, because frames are preserved.
+///
+/// THREADING: one producer thread and one consumer thread, serialised by an internal mutex. Both sides
+/// are called at a buffer cadence -- tens of times a second, not per frame -- so the mutex costs
+/// nothing measurable and buys an obviously-correct implementation instead of a hand-rolled seqlock
+/// over a 24-byte entry.
+class RenderTagTrack {
+ public:
+  /// @brief Forget everything and restart both positions at zero.
+  /// @note Call only while the queue this describes is empty and neither side is running -- a
+  /// reset with audio in flight would re-map surviving frames onto new positions.
+  void reset() {
+    LockGuard guard(this->mutex_);
+    this->count_ = 0;
+    this->next_ = 0;
+    this->write_pos_ = 0;
+    this->pending_ = RenderTag{};
+    this->pending_set_ = false;
+  }
+
+  /// @brief Attach ``tag`` to the first frame of the next non-empty ``note_written()``.
+  ///
+  /// Stateful, and therefore racy if two producers write the same queue. That is accepted rather than
+  /// designed around: the tagging path exists for a single synchronised producer, and every other
+  /// caller simply never tags, which leaves the audio untagged rather than mistagged.
+  void set_next(const RenderTag &tag) {
+    LockGuard guard(this->mutex_);
+    this->pending_ = tag;
+    this->pending_set_ = true;
+  }
+
+  /// @brief Report ``frames`` accepted into the queue, consuming any tag set since the last report.
+  /// @note Pass what the queue ACTUALLY took, never what was offered: a short write that counted in
+  /// full would slide every later tag forward by the shortfall.
+  void note_written(uint32_t frames) {
+    if (frames == 0) {
+      // A refused write leaves the pending tag pending: it still describes the next frame to land.
+      return;
+    }
+    LockGuard guard(this->mutex_);
+    if (this->pending_set_ && !this->continues_last_(this->pending_)) {
+      // Only a DISCONTINUITY needs its own entry. A producer that re-states the identity of every
+      // write -- the normal case, since a source chunk is usually split across several -- would
+      // otherwise fill the ring with restatements of one fact and evict tags the sink has not
+      // reached yet, turning valid readings into skipped ones.
+      this->entries_[this->next_] = Entry{this->write_pos_, this->pending_};
+      this->next_ = (this->next_ + 1) % ENTRIES;
+      if (this->count_ < ENTRIES) {
+        this->count_++;
+      }
+    }
+    this->pending_set_ = false;
+    this->write_pos_ += frames;
+  }
+
+  /// @brief Total frames reported through ``note_written()`` since the last reset.
+  uint64_t written() const {
+    LockGuard guard(this->mutex_);
+    return this->write_pos_;
+  }
+
+  /// @brief The tag covering stream frame ``read_pos``, with ``offset_frames`` advanced to that frame.
+  /// @return An INVALID tag when that frame is not covered -- it predates the oldest retained tag, or
+  /// the producer explicitly marked the run untagged. Never a guess.
+  RenderTag tag_at(uint64_t read_pos) const {
+    LockGuard guard(this->mutex_);
+    const Entry *best = nullptr;
+    for (size_t i = 0; i < this->count_; i++) {
+      const Entry &entry = this->entries_[i];
+      if (entry.pos <= read_pos && (best == nullptr || entry.pos > best->pos)) {
+        best = &entry;
+      }
+    }
+    if (best == nullptr || !best->tag.valid()) {
+      return RenderTag{};
+    }
+    const uint64_t advance = read_pos - best->pos;
+    RenderTag tag = best->tag;
+    tag.offset_frames += static_cast<uint32_t>(advance);
+    return tag;
+  }
+
+ protected:
+  struct Entry {
+    uint64_t pos;
+    RenderTag tag;
+  };
+
+  /// @brief Whether ``tag`` says exactly what the newest entry already implies about ``write_pos_``.
+  /// @note Caller holds the mutex.
+  bool continues_last_(const RenderTag &tag) const {
+    if (this->count_ == 0) {
+      // Nothing recorded yet, so nothing to continue -- not even an untagged run, since a consumer
+      // reading before the first entry already gets an invalid tag.
+      return !tag.valid();
+    }
+    const Entry &last = this->entries_[(this->next_ + ENTRIES - 1) % ENTRIES];
+    if (!tag.valid() || !last.tag.valid()) {
+      // Two untagged runs are one untagged run; a tagged run after an untagged one is a change.
+      return !tag.valid() && !last.tag.valid();
+    }
+    return tag.server_ts == last.tag.server_ts &&
+           static_cast<uint64_t>(tag.offset_frames) ==
+               static_cast<uint64_t>(last.tag.offset_frames) + (this->write_pos_ - last.pos);
+  }
+
+  /// Sized to outlive the deepest queue a tag has to survive: a 100 ms speaker ring plus a 50 ms DMA
+  /// span is ~6 chunks of audio, and a producer may split a chunk across several writes. Overrun is
+  /// not a correctness hazard -- ``tag_at`` returns invalid for a frame whose tag has been evicted, so
+  /// the reading is skipped rather than fabricated.
+  static constexpr size_t ENTRIES = 32;
+
+  mutable Mutex mutex_;
+  Entry entries_[ENTRIES]{};
+  size_t count_{0};  // entries currently retained, saturating at ENTRIES
+  size_t next_{0};   // ring cursor for the next entry written
+  uint64_t write_pos_{0};
+  RenderTag pending_{};
+  bool pending_set_{false};
+};
+
 /// @brief A depth reading and the instant it describes.
 ///
 /// The instant is not decoration. A speaker that buffers on a task publishes a snapshot, so it stamps

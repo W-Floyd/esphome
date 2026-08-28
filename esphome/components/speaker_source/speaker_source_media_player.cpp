@@ -41,6 +41,18 @@ bool SourceBinding::buffered_audio(audio::AudioDepth &depth) const {
   return spk->buffered_audio(depth);
 }
 
+void SourceBinding::set_next_render_tag(const audio::RenderTag &tag) {
+  speaker::Speaker *spk = this->player->get_pipeline_speaker_(this->pipeline);
+  if (spk != nullptr) {
+    spk->set_next_render_tag(tag);
+  }
+}
+
+bool SourceBinding::supports_render_tags() const {
+  speaker::Speaker *spk = this->player->get_pipeline_speaker_(this->pipeline);
+  return spk != nullptr && spk->supports_render_tags();
+}
+
 void SourceBinding::report_state(media_source::MediaSourceState state) {
   this->player->handle_media_state_changed_(this->pipeline, this->source, state);
 }
@@ -98,6 +110,10 @@ void SpeakerSourceMediaPlayer::setup() {
       this->pipelines_[i].speaker->add_audio_output_callback([this, i](uint32_t frames, int64_t timestamp) {
         this->handle_speaker_playback_callback_(frames, timestamp, i);
       });
+      this->pipelines_[i].speaker->add_tagged_output_callback(
+          [this, i](uint32_t frames, int64_t adjusted_ts, audio::RenderTag tag) {
+            this->handle_speaker_tagged_callback_(frames, adjusted_ts, tag, i);
+          });
     }
   }
 }
@@ -124,6 +140,20 @@ void SpeakerSourceMediaPlayer::handle_speaker_playback_callback_(uint32_t frames
   if (source_frames > 0) {
     // Notify the source about the played audio
     active_source->notify_audio_played(source_frames, timestamp);
+  }
+}
+
+// THREAD CONTEXT: Called from the speaker's playback callback task (not main loop)
+void SpeakerSourceMediaPlayer::handle_speaker_tagged_callback_(uint32_t frames, int64_t adjusted_ts,
+                                                              audio::RenderTag tag, uint8_t pipeline) {
+  PipelineContext &ps = this->pipelines_[pipeline];
+
+  // Same load-once discipline as the untagged path. No pending_frames arithmetic here: the tag says
+  // which audio this is, so there is nothing to attribute -- and the untagged callback has already
+  // debited these very frames.
+  media_source::MediaSource *active_source = ps.active_source.load(std::memory_order_relaxed);
+  if (active_source != nullptr) {
+    active_source->notify_audio_played_tagged(frames, adjusted_ts, tag);
   }
 }
 

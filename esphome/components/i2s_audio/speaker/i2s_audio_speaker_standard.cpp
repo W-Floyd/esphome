@@ -142,6 +142,10 @@ void I2SAudioSpeaker::run_speaker_task() {
                                                         static_cast<uint8_t>(bytes_per_frame));
 
     if (audio_source != nullptr) {
+      // Restart tag positions from zero BEFORE the ring is published. play() can only reach the ring
+      // through this weak_ptr, so until it is assigned no producer exists and the reset cannot race
+      // one -- which is the only instant where that is true.
+      this->tag_track_.reset();
       // audio_source is nullptr if the ring buffer fails to allocate
       this->audio_ring_buffer_ = temp_ring_buffer;
       successful_setup = true;
@@ -161,8 +165,9 @@ void I2SAudioSpeaker::run_speaker_task() {
         successful_setup = false;
         break;
       }
-      uint32_t zero_real_frames = 0;
-      if (xQueueSend(this->write_records_queue_, &zero_real_frames, 0) != pdTRUE) {
+      // Untagged by construction: this is preloaded silence, not caller audio.
+      const WriteRecord preload_record{};
+      if (xQueueSend(this->write_records_queue_, &preload_record, 0) != pdTRUE) {
         // Should never happen: the queue was just reset and is sized for DMA_BUFFERS_COUNT * 2 entries.
         ESP_LOGV(TAG, "Failed to push preload write record");
         successful_setup = false;
@@ -194,6 +199,11 @@ void I2SAudioSpeaker::run_speaker_task() {
     // write_records_queue_. Separates the caller's own audio from the silence padding that shares
     // those descriptors, which render_latency() counts and buffered_audio() must not.
     uint32_t dma_real_frames = 0;
+    // Real frames pulled out of the ring and committed to descriptors, counted in the same stream
+    // position space tag_track_ binds tags to. This is the CONSUMER side of that track: the position
+    // of the first real frame of the descriptor about to be composed is exactly this value, so the
+    // identity of that frame is a lookup rather than an inference.
+    uint64_t stream_read_frames = 0;
     // ISR timestamp of the most recent descriptor completion, i.e. the last DMA buffer BOUNDARY.
     // The render latency below needs it: the descriptors are always full, so a frame handed over now
     // waits for every descriptor ahead of it PLUS the part of the head descriptor that has not been
@@ -253,14 +263,15 @@ void I2SAudioSpeaker::run_speaker_task() {
       int64_t write_timestamp;
       bool lockstep_broken = false;
       while (xQueueReceive(this->i2s_event_queue_, &write_timestamp, 0)) {
-        uint32_t real_frames = 0;
-        if (xQueueReceive(this->write_records_queue_, &real_frames, 0) != pdTRUE) {
+        WriteRecord record{};
+        if (xQueueReceive(this->write_records_queue_, &record, 0) != pdTRUE) {
           // Should never happen: would indicate the lockstep invariant is broken.
           ESP_LOGV(TAG, "Event without matching write record");
           xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::ERR_LOCKSTEP_DESYNC);
           lockstep_broken = true;
           break;
         }
+        const uint32_t real_frames = record.real_frames;
         dma_real_frames -= std::min(dma_real_frames, real_frames);
         dbg_completed_real += real_frames;
         // Latest boundary wins: several completions can drain in one iteration after a scheduling gap.
@@ -274,6 +285,14 @@ void I2SAudioSpeaker::run_speaker_task() {
           const int64_t adjusted_ts =
               write_timestamp - this->current_stream_info_.frames_to_microseconds(silence_frames);
           this->audio_output_callback_(real_frames, adjusted_ts);
+          // The captured pair: this descriptor's real audio finished at adjusted_ts, and record.tag
+          // says WHICH audio that was. A consumer walks back real_frames' worth of time to reach the
+          // first real frame, which is the frame the tag identifies. Suppressed for an untagged
+          // descriptor -- audio the producer inserted itself (silence, a splice, a repeated frame)
+          // corresponds to no source time, and reporting one for it would be a fabrication.
+          if (record.tag.valid()) {
+            this->tagged_output_callback_(real_frames, adjusted_ts, record.tag);
+          }
         }
       }
       if (lockstep_broken) {
@@ -470,7 +489,14 @@ void I2SAudioSpeaker::run_speaker_task() {
       // invariant is broken and every subsequent timestamp would be silently wrong, so bail.
       dma_real_frames += real_frames_total;
       dbg_written_real += real_frames_total;
-      if (xQueueSend(this->write_records_queue_, &real_frames_total, 0) != pdTRUE) {
+      // Identify this descriptor by its FIRST real frame -- the position the read counter held before
+      // this iteration consumed anything. A descriptor (441 frames) is smaller than a source chunk
+      // (1152), so descriptors straddle chunks and the position inside the chunk is the whole point:
+      // an identifier naming only the chunk could not place the boundary.
+      const WriteRecord record{real_frames_total,
+                               real_frames_total > 0 ? this->tag_track_.tag_at(stream_read_frames) : audio::RenderTag{}};
+      stream_read_frames += real_frames_total;
+      if (xQueueSend(this->write_records_queue_, &record, 0) != pdTRUE) {
         ESP_LOGV(TAG, "Exiting: write records queue full");
         xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::ERR_LOCKSTEP_DESYNC);
         break;

@@ -35,6 +35,14 @@ class ResamplerSpeaker final : public Component, public speaker::Speaker {
   bool render_latency(audio::AudioDepth &depth) const override;
   bool buffered_audio(audio::AudioDepth &depth) const override;
 
+  /// @brief Never, and stated explicitly rather than left to the default so the reason is on record.
+  ///
+  /// A render tag locates audio as a frame offset from a timestamp, and this stage changes how many
+  /// frames that audio is: one frame in is not one frame out, so an offset crossing it would need
+  /// scaling by a ratio that is itself approximate. Refusing is the honest answer; a scaled offset
+  /// would be a plausible-looking one, wrong by the resampler's own rounding.
+  bool supports_render_tags() const override { return false; }
+
   /// @brief Mute state changes are passed to the parent's output speaker
   void set_mute_state(bool mute_state) override;
   bool get_mute_state() override { return this->output_speaker_->get_mute_state(); }

@@ -182,7 +182,9 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
       if (preload_err != ESP_OK) {
         break;  // DMA preload buffer full or error
       }
-      const uint32_t silence_record = 0;
+      // Untagged by construction: preloaded silence is not caller audio, so there is no identity
+      // to attach and none is invented.
+      const WriteRecord silence_record{};
       xQueueSendToBack(this->write_records_queue_, &silence_record, 0);
     }
     this->spdif_encoder_->set_preload_mode(false);
@@ -266,13 +268,17 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
         // Lockstep: pop the matching record (real audio frames packed into this DMA block).
         // Records are pushed by the task right after each successful block commit, so the FIFO
         // order matches DMA completion order. Empty records queue here means lockstep broke.
-        uint32_t real_frames = 0;
-        if (xQueueReceive(this->write_records_queue_, &real_frames, 0) != pdTRUE) {
+        WriteRecord record{};
+        if (xQueueReceive(this->write_records_queue_, &record, 0) != pdTRUE) {
           ESP_LOGV(TAG, "Event without matching write record");
           xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::ERR_LOCKSTEP_DESYNC);
           lockstep_broken = true;
           break;
         }
+
+        // SPDIF does not report tagged renders (``supports_render_tags()`` stays false), so the
+        // record's tag is carried for structural uniformity with the standard writer and never read.
+        const uint32_t real_frames = record.real_frames;
 
         // Per-block timestamp adjustment: shift back by the silence-padding portion of the block
         // so the reported timestamp reflects when the last real sample left the wire.
@@ -371,7 +377,8 @@ void I2SAudioSpeakerSPDIF::run_speaker_task() {
 
       // One block committed to DMA; push exactly one record carrying its real-audio frame count.
       // Failure here means the records queue is full, which violates the lockstep invariant.
-      if (xQueueSendToBack(this->write_records_queue_, &real_frames_in_block, 0) != pdTRUE) {
+      const WriteRecord block_record{real_frames_in_block, audio::RenderTag{}};
+      if (xQueueSendToBack(this->write_records_queue_, &block_record, 0) != pdTRUE) {
         xEventGroupSetBits(this->event_group_, SpeakerEventGroupBits::ERR_LOCKSTEP_DESYNC);
         break;
       }

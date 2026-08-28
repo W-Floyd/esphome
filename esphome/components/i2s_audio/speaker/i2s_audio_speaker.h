@@ -43,6 +43,20 @@ enum SpeakerEventGroupBits : uint32_t {
   ALL_BITS = 0x00FFFFFF,  // All valid FreeRTOS event group bits
 };
 
+/// @brief One entry of the lockstep record queue: what a single DMA descriptor holds.
+///
+/// Pushed when a descriptor is composed, popped when the ISR reports that descriptor completed, so it
+/// is the only place a completion event can learn anything about the audio it just finished. It
+/// already had to carry the real-frame count -- a descriptor may be part silence padding, and padding
+/// renders but is not the caller's audio -- and the tag rides the same structure because the identity
+/// of a descriptor's audio has exactly the same lifetime as its frame count.
+struct WriteRecord {
+  /// Frames of caller audio in this descriptor, packed at its start. 0 for a pure-silence descriptor.
+  uint32_t real_frames{0};
+  /// Identity of this descriptor's FIRST REAL FRAME; invalid when that frame carried no tag.
+  audio::RenderTag tag{};
+};
+
 /// @brief Abstract base class for I2S audio speaker implementations.
 /// Provides shared infrastructure (event groups, ring buffer, volume control, task lifecycle)
 /// for derived standard I2S and SPDIF speaker classes.
@@ -80,6 +94,11 @@ class I2SAudioSpeakerBase : public I2SAudioOut, public speaker::Speaker, public 
   bool has_buffered_data() const override;
   bool render_latency(audio::AudioDepth &depth) const override;
   bool buffered_audio(audio::AudioDepth &depth) const override;
+
+  /// @brief Holds the tag until ``play()`` reports how many frames the ring actually took, then binds
+  /// it to that payload's first frame. Harmless on a subclass that never reports tagged renders: the
+  /// track is written and simply never read.
+  void set_next_render_tag(const audio::RenderTag &tag) override { this->tag_track_.set_next(tag); }
 
   /// @brief Sets the volume of the speaker. Uses the speaker's configured audio dac component. If unavailble, it is
   /// implemented as a software volume control. Overrides the default setter to convert the floating point volume to a
@@ -152,6 +171,15 @@ class I2SAudioSpeakerBase : public I2SAudioOut, public speaker::Speaker, public 
   QueueHandle_t write_records_queue_{nullptr};
 
   std::weak_ptr<ring_buffer::RingBuffer> audio_ring_buffer_;
+
+  /// @brief Render tags bound to positions in this speaker's ring, written by ``play()`` and read by
+  /// the speaker task as it composes each DMA descriptor.
+  ///
+  /// Positions are ring frames, so the two sides need no shared clock and no shared lock beyond this
+  /// object's own: the producer says how many frames it added, the consumer says how many it took, and
+  /// the difference is exactly the audio between them. Reset by the task before it publishes the ring,
+  /// which is the only instant at which no producer can be writing.
+  audio::RenderTagTrack tag_track_;
 
   uint32_t buffer_duration_ms_;
   // Both depth readings and the instant they describe, PUBLISHED BY THE SPEAKER TASK. Readers load

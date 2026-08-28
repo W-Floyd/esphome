@@ -208,6 +208,10 @@ size_t I2SAudioSpeakerBase::play(const uint8_t *data, size_t length, TickType_t 
       // actually took, not from what was offered, so a short write cannot inflate it.
       this->dbg_received_frames_.fetch_add(this->audio_stream_info_.bytes_to_frames(bytes_written),
                                            std::memory_order_relaxed);
+      // Bind any pending render tag to this payload's first frame, at the ring position it actually
+      // landed at. Same reason as the counter above: the ring may take less than was offered, and a
+      // tag placed at an offered-but-unwritten position would mis-identify every frame after it.
+      this->tag_track_.note_written(this->audio_stream_info_.bytes_to_frames(bytes_written));
     }
   }
 
@@ -293,7 +297,7 @@ esp_err_t I2SAudioSpeakerBase::init_i2s_channel_(const i2s_chan_config_t &chan_c
   // Lockstep records queue. One record per in-flight DMA buffer; sized to match the I2S event queue
   // so a fully-saturated DMA pipeline cannot overflow either side before drain.
   if (this->write_records_queue_ == nullptr) {
-    this->write_records_queue_ = xQueueCreate(event_queue_size, sizeof(uint32_t));
+    this->write_records_queue_ = xQueueCreate(event_queue_size, sizeof(WriteRecord));
   } else {
     xQueueReset(this->write_records_queue_);
   }

@@ -72,6 +72,20 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
   void set_pause_state(bool pause_state) override { this->pause_state_ = pause_state; }
   bool get_pause_state() const override { return this->pause_state_; }
 
+  /// @brief Binds the tag to this source's ring, exactly as the sink does with its own.
+  ///
+  /// The mixer preserves frame counts (it converts sample width and channel count, never rate), so a
+  /// tag's frame arithmetic survives the crossing and the value handed back is the caller's own.
+  void set_next_render_tag(const audio::RenderTag &tag) override { this->tag_track_.set_next(tag); }
+
+  /// @brief True only while this source is the ONLY one the mixer is blending.
+  ///
+  /// A tag from one source says nothing about a blend of two, so the honest answer with a second
+  /// source active is that identity is not available -- not a tag that names one contributor to a
+  /// sum. The mixer enforces that independently by marking blended output untagged; this is the
+  /// advertisement of it, and it changes as sources start and stop.
+  bool supports_render_tags() const override;
+
   /// @brief Exposes the next ring buffer chunk (zero-copy) and ducks the freshly exposed bytes in place.
   /// If the source still has bytes from a prior partial consume, this is a no-op (those bytes were already
   /// ducked on the fill that exposed them).
@@ -118,6 +132,20 @@ class SourceSpeaker final : public speaker::Speaker, public Component {
   std::atomic<uint32_t> dbg_consumed_frames_{0};
   std::shared_ptr<audio::RingBufferAudioSource> audio_source_;
   std::weak_ptr<ring_buffer::RingBuffer> ring_buffer_;
+
+  /// @brief Tag covering the next ``frames`` this source is about to hand the mixer, advancing the
+  /// read position past them.
+  /// @note MIXER TASK ONLY, called once per mixing pass in the same order the frames are consumed.
+  /// Must be called for every consumed block, blended ones included, or the position stops matching
+  /// the ring and every later lookup names the wrong audio.
+  audio::RenderTag take_render_tag(uint32_t frames);
+
+  /// Render tags bound to positions in this source's ring: written by play(), read by the mixer task.
+  audio::RenderTagTrack tag_track_;
+  /// Frames the mixer has consumed out of this source, i.e. the read position into ``tag_track_``.
+  /// Mixer task only, apart from the reset in start_() -- which runs while this source is STARTING,
+  /// a state the mixer task skips, so the two never touch it at once.
+  uint64_t tag_consumed_frames_{0};
 
   uint32_t buffer_duration_ms_;
   uint32_t last_seen_data_ms_{0};
@@ -192,6 +220,13 @@ class MixerSpeaker final : public Component {
   /// @brief Returns the current number of frames in the output pipeline (written but not yet played)
   uint32_t get_frames_in_pipeline() const { return this->frames_in_pipeline_.load(std::memory_order_acquire); }
 
+  /// @brief How many source speakers are currently running, paused ones included.
+  ///
+  /// Paused counts: a paused source contributes nothing right now but can resume between one mixing
+  /// pass and the next, and a capability that flickers with the pause state would have a caller
+  /// starting to tag audio it cannot trust the moment playback resumed.
+  size_t running_source_count() const;
+
  protected:
   static void audio_mixer_task(void *params);
 
@@ -233,6 +268,19 @@ class MixerSpeaker final : public Component {
   uint32_t dbg_written_to_sink_frames_{0};
   int64_t depth_debug_last_us_{0};  // TEMPORARY: time-throttles the DEPTH diagnostic
   optional<audio::AudioStreamInfo> audio_stream_info_;
+
+  /// Render tags bound to positions in the stream this mixer hands the SINK. Both sides are the mixer
+  /// task -- written as audio is mixed in, read as it is transferred out -- because the output
+  /// transfer buffer sits between the two and the tag has to survive it.
+  audio::RenderTagTrack out_tag_track_;
+  /// Frames handed to the sink, i.e. the read position into ``out_tag_track_``. Mixer task only.
+  uint64_t tag_sent_frames_{0};
+  /// @brief The source whose tags the sink is currently carrying, or nullptr.
+  ///
+  /// A tag comes back from the sink as opaque bytes with no sender attached, so this is what decides
+  /// where to deliver it. Only ever one source at a time by construction: blended output is marked
+  /// untagged, so no tagged render can be in flight while two sources contribute.
+  std::atomic<SourceSpeaker *> tag_owner_{nullptr};
 
   std::atomic<uint32_t> frames_in_pipeline_{0};  // Frames written to output but not yet played
   uint32_t all_stopped_since_ms_{0};             // Debounce transient all-stopped windows before stopping task

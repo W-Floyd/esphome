@@ -166,6 +166,47 @@ class Speaker {
     this->audio_output_callback_.add(std::forward<F>(callback));
   }
 
+  /// @brief An opaque identity for the audio handed over by the NEXT ``play()`` call, if this speaker
+  /// can carry one.
+  ///
+  /// The default is to ignore it, and that is the correct default: a speaker that silently dropped the
+  /// tag but still reported tagged renders would report the WRONG identity, which is worse than
+  /// reporting none. ``supports_render_tags()`` is how a caller finds out which it got.
+  ///
+  /// STATEFUL, and therefore racy if anything else calls ``play()`` on the same speaker in between.
+  /// Documented rather than designed around: the caller that tags is a single synchronised producer,
+  /// and untagged audio simply yields no tagged render report.
+  ///
+  /// @param tag Identity of the first frame of the next payload. See audio::RenderTag.
+  virtual void set_next_render_tag(const audio::RenderTag & /*tag*/) {}
+
+  /// @brief Whether tags set through ``set_next_render_tag()`` reach a real sink and come back.
+  ///
+  /// False by default, and false is the answer whenever the identity could not be preserved end to
+  /// end -- through a resampler, which changes the frame count the tag's offset is measured in, or
+  /// through a mixer blending more than one source, where a tag from one source says nothing about the
+  /// blend. Silence is right in both cases; a wrong tag is not.
+  ///
+  /// May change at runtime as sources start and stop, so a caller must not cache one reading taken at
+  /// setup.
+  virtual bool supports_render_tags() const { return false; }
+
+  /// Callback for the render of audio that carried a tag, handing back the identity the caller
+  /// attached. Fires ONLY for a completed buffer whose FIRST REAL FRAME carried a valid tag, so the
+  /// pair is a CAPTURED observation rather than one inferred from a caller's own frame ledger.
+  /// Parameters:
+  ///   - Frames of real (non-padding) audio in that buffer
+  ///   - System time in microseconds at which that buffer's real audio FINISHED rendering, already
+  ///     corrected for trailing silence padding -- so its first real frame rendered exactly that many
+  ///     frames' worth of time earlier
+  ///   - The tag attached to that first real frame, with ``offset_frames`` advanced to it
+  ///
+  /// Fires ALONGSIDE add_audio_output_callback(), never instead of it: the quantity accounting is
+  /// unchanged and this adds identity to it.
+  template<typename F> void add_tagged_output_callback(F &&callback) {
+    this->tagged_output_callback_.add(std::forward<F>(callback));
+  }
+
  protected:
   State state_{STATE_STOPPED};
   audio::AudioStreamInfo audio_stream_info_;
@@ -177,6 +218,7 @@ class Speaker {
 #endif
 
   CallbackManager<void(uint32_t, int64_t)> audio_output_callback_{};
+  CallbackManager<void(uint32_t, int64_t, audio::RenderTag)> tagged_output_callback_{};
 };
 
 }  // namespace esphome::speaker
